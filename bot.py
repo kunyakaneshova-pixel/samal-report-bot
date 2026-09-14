@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import traceback
+import threading
 from datetime import datetime
 from collections import defaultdict
 
@@ -36,6 +37,7 @@ LAST_AVG_CHECK_SUMMARY = None
 LAST_REPORT_META = None
 LAST_REPORT_SNAPSHOT = None
 PREVIOUS_REPORT_SNAPSHOT = None
+PROCESSING_FILE_IDS = set()
 
 TITLE_FILL = "1F4E78"
 HEADER_FILL = "D9EAF7"
@@ -659,8 +661,119 @@ def setup_webhook():
 
 
 @app.post("/telegram")
+
+def process_document_in_background(chat_id, doc):
+    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY
+    global LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY
+    global LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT
+
+    file_id = doc.get("file_id")
+
+    try:
+        f_info = tg("getFile", json={"file_id": file_id})
+        file_path = f_info["file_path"]
+        response = requests.get(f"{TELEGRAM_FILE_API}/{file_path}", timeout=60)
+        response.raise_for_status()
+        content = response.content
+
+        with tempfile.TemporaryDirectory() as td:
+            inp = os.path.join(td, "iiko.xlsx")
+            out = os.path.join(td, "Samal_Report.xlsx")
+
+            with open(inp, "wb") as f:
+                f.write(content)
+
+            product_summary, product_city_summary = parse_product_report(inp)
+            avg_check_summary = parse_average_check_report(inp)
+
+            if product_summary:
+                LAST_PRODUCT_SUMMARY = product_summary
+                LAST_PRODUCT_CITY_SUMMARY = product_city_summary
+
+                if avg_check_summary:
+                    LAST_AVG_CHECK_SUMMARY = avg_check_summary
+
+                message = (
+                    "Файл по наименованиям обработан ✅\n"
+                    "Доступны: «🔥 Топ продукции», «🐢 Слабые позиции», "
+                    "«🏙 Топ продукции по городам»"
+                )
+                if avg_check_summary:
+                    message += " и «🧾 Средний чек»."
+                else:
+                    message += "."
+
+                send_message(chat_id, message, keyboard=True)
+                return
+
+            if avg_check_summary:
+                LAST_AVG_CHECK_SUMMARY = avg_check_summary
+                send_message(
+                    chat_id,
+                    f"Отчет по среднему чеку обработан ✅\n"
+                    f"Найдено магазинов: {len(avg_check_summary)}\n\n"
+                    "Теперь нажми «🧾 Средний чек».",
+                    keyboard=True
+                )
+                return
+
+            total_fact, plan, forecast, days, city_summary, store_summary, category_summary = build_report(inp, out)
+            pct = forecast / plan if plan else 0
+
+            LAST_CITY_SUMMARY = city_summary
+            LAST_STORE_SUMMARY = store_summary
+            LAST_CATEGORY_SUMMARY = category_summary
+            LAST_REPORT_META = {"days": days}
+
+            city_facts_snapshot = {
+                city: d["fact"]
+                for city, d in city_summary.items()
+            }
+
+            current_snapshot = {
+                "days": days,
+                "total_fact": total_fact,
+                "store_facts": {k: v["fact"] for k, v in store_summary.items()},
+                "category_facts": {k: v["fact"] for k, v in category_summary.items()},
+                "city_facts": city_facts_snapshot,
+            }
+
+            if LAST_REPORT_SNAPSHOT is None:
+                LAST_REPORT_SNAPSHOT = current_snapshot
+            elif days > LAST_REPORT_SNAPSHOT.get("days", 0):
+                PREVIOUS_REPORT_SNAPSHOT = LAST_REPORT_SNAPSHOT
+                LAST_REPORT_SNAPSHOT = current_snapshot
+            elif days == LAST_REPORT_SNAPSHOT.get("days", 0):
+                LAST_REPORT_SNAPSHOT = current_snapshot
+            else:
+                PREVIOUS_REPORT_SNAPSHOT = current_snapshot
+
+            caption = (
+                f"Готово ✅\n"
+                f"Факт за 1–{days}: {total_fact:,.0f} тг\n"
+                f"Прогноз: {forecast:,.0f} тг ({pct:.1%})"
+            ).replace(",", " ")
+
+            send_document(chat_id, out, caption=caption)
+
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            send_message(
+                chat_id,
+                "Не получилось обработать файл.\n\n" + str(e)[:3000],
+                keyboard=True
+            )
+        except Exception:
+            pass
+
+    finally:
+        if file_id:
+            PROCESSING_FILE_IDS.discard(file_id)
+
+
 def telegram_webhook():
-    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT
+    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT, PROCESSING_FILE_IDS
     update = request.get_json(silent=True) or {}
     try:
         msg = update.get("message") or {}
@@ -1149,87 +1262,20 @@ def telegram_webhook():
             send_message(chat_id, "Мне нужен файл Excel с расширением .xlsx.")
             return "ok"
 
+        file_id = doc.get("file_id")
+        if file_id in PROCESSING_FILE_IDS:
+            return "ok"
+
+        PROCESSING_FILE_IDS.add(file_id)
         send_message(chat_id, "Файл получила ✅ Считаю отчет...")
 
-        f_info = tg("getFile", json={"file_id": doc["file_id"]})
-        file_path = f_info["file_path"]
-        content = requests.get(f"{TELEGRAM_FILE_API}/{file_path}", timeout=60).content
+        threading.Thread(
+            target=process_document_in_background,
+            args=(chat_id, doc),
+            daemon=True
+        ).start()
 
-        with tempfile.TemporaryDirectory() as td:
-            inp = os.path.join(td, "iiko.xlsx")
-            out = os.path.join(td, "Samal_Report.xlsx")
-            with open(inp,"wb") as f:
-                f.write(content)
-
-            product_summary, product_city_summary = parse_product_report(inp)
-            avg_check_summary = parse_average_check_report(inp)
-
-            if product_summary:
-                LAST_PRODUCT_SUMMARY = product_summary
-                LAST_PRODUCT_CITY_SUMMARY = product_city_summary
-                if avg_check_summary:
-                    LAST_AVG_CHECK_SUMMARY = avg_check_summary
-
-                message = (
-                    "Файл по наименованиям обработан ✅\n"
-                    "Доступны: «🔥 Топ продукции», «🐢 Слабые позиции», "
-                    "«🏙 Топ продукции по городам»"
-                )
-                if avg_check_summary:
-                    message += " и «🧾 Средний чек»."
-                else:
-                    message += "."
-
-                send_message(chat_id, message, keyboard=True)
-                return "ok"
-
-            if avg_check_summary:
-                LAST_AVG_CHECK_SUMMARY = avg_check_summary
-                send_message(
-                    chat_id,
-                    f"Отчет по среднему чеку обработан ✅\n"
-                    f"Найдено магазинов: {len(avg_check_summary)}\n\n"
-                    "Теперь нажми «🧾 Средний чек».",
-                    keyboard=True
-                )
-                return "ok"
-
-            total_fact, plan, forecast, days, city_summary, store_summary, category_summary = build_report(inp, out)
-            pct = forecast/plan if plan else 0
-            LAST_CITY_SUMMARY = city_summary
-            LAST_STORE_SUMMARY = store_summary
-            LAST_CATEGORY_SUMMARY = category_summary
-            LAST_REPORT_META = {"days": days}
-
-            city_facts_snapshot = {}
-            for city, d in city_summary.items():
-                city_facts_snapshot[city] = d["fact"]
-
-            current_snapshot = {
-                "days": days,
-                "total_fact": total_fact,
-                "store_facts": {k: v["fact"] for k, v in store_summary.items()},
-                "category_facts": {k: v["fact"] for k, v in category_summary.items()},
-                "city_facts": city_facts_snapshot,
-            }
-
-            if LAST_REPORT_SNAPSHOT is None:
-                LAST_REPORT_SNAPSHOT = current_snapshot
-            elif days > LAST_REPORT_SNAPSHOT.get("days", 0):
-                PREVIOUS_REPORT_SNAPSHOT = LAST_REPORT_SNAPSHOT
-                LAST_REPORT_SNAPSHOT = current_snapshot
-            elif days == LAST_REPORT_SNAPSHOT.get("days", 0):
-                LAST_REPORT_SNAPSHOT = current_snapshot
-            else:
-                PREVIOUS_REPORT_SNAPSHOT = current_snapshot
-
-            caption = (
-                f"Готово ✅\n"
-                f"Факт за 1–{days}: {total_fact:,.0f} тг\n"
-                f"Прогноз: {forecast:,.0f} тг ({pct:.1%})"
-            ).replace(",", " ")
-
-            send_document(chat_id, out, caption=caption)
+        return "ok"
 
     except Exception as e:
         traceback.print_exc()
