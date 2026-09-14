@@ -41,8 +41,20 @@ def tg(method, **kwargs):
     return data["result"]
 
 
-def send_message(chat_id, text):
-    return tg("sendMessage", json={"chat_id": chat_id, "text": text})
+MAIN_KEYBOARD = {
+    "keyboard": [
+        [{"text": "📊 Сделать отчет"}, {"text": "📋 Правила объединения"}],
+        [{"text": "🎯 Планы"}, {"text": "ℹ️ Помощь"}]
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True
+}
+
+def send_message(chat_id, text, keyboard=False):
+    payload = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        payload["reply_markup"] = MAIN_KEYBOARD
+    return tg("sendMessage", json=payload)
 
 
 def send_document(chat_id, path, caption=""):
@@ -380,12 +392,80 @@ def telegram_webhook():
         if not chat_id:
             return "ok"
 
-        text = msg.get("text","")
+        text = msg.get("text","").strip()
+
         if text == "/start":
-            send_message(chat_id,
-                "Привет! 👋\n"
-                "Отправь мне свежий Excel-файл (.xlsx) из iiko.\n"
-                "Я сделаю отчет: сводка, города, все магазины, категории и прогноз."
+            send_message(
+                chat_id,
+                "Привет! 👋
+"
+                "Я твой помощник по отчетам SamalCakes.
+
+"
+                "Нажми «📊 Сделать отчет» или просто отправь свежий Excel-файл (.xlsx) из iiko.",
+                keyboard=True
+            )
+            return "ok"
+
+        if text == "📊 Сделать отчет":
+            send_message(
+                chat_id,
+                "Отправь сюда свежую выгрузку .xlsx из iiko.
+"
+                "Я автоматически сделаю полный отчет: сводка, города, все магазины, категории и прогноз.",
+                keyboard=True
+            )
+            return "ok"
+
+        if text == "📋 Правила объединения":
+            rules = (
+                "Правила объединения категорий:
+
+"
+                "• Печенье → Чайные наборы, пирожное
+"
+                "• Заказные торты → Заказные десерты Samal Premium
+"
+                "• Булочки + Самса + Хлебобулочные → Хлебобулочные изделия
+"
+                "• Шоколад → Десерты
+"
+                "• Горячие напитки + Напитки Актобе + Упаковка + Доставка + Хоз товары + Инвентарь/посуда → Общая номенклатура"
+            )
+            send_message(chat_id, rules, keyboard=True)
+            return "ok"
+
+        if text == "🎯 Планы":
+            total = sum(v["plan"] for v in PLANS.values())
+            city_plans = defaultdict(float)
+            for store, data in PLANS.items():
+                city_plans[store.split("/")[0]] += data["plan"]
+
+            lines = [f"Общий план месяца: {total:,.0f} тг".replace(",", " "), ""]
+            for city, value in city_plans.items():
+                lines.append(f"{city}: {value:,.0f} тг".replace(",", " "))
+
+            send_message(chat_id, "
+".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "ℹ️ Помощь":
+            send_message(
+                chat_id,
+                "Как пользоваться ботом:
+
+"
+                "1. Нажми «📊 Сделать отчет».
+"
+                "2. Отправь свежий файл .xlsx из iiko.
+"
+                "3. Подожди немного.
+"
+                "4. Я верну готовый Excel-отчет.
+
+"
+                "Можно и без кнопки — просто отправить файл.",
+                keyboard=True
             )
             return "ok"
 
