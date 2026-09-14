@@ -27,6 +27,9 @@ STORE_MAPPING = CONFIG["store_mapping"]
 GROUP_MAPPING = CONFIG["group_mapping"]
 DAYS_IN_MONTH = int(CONFIG.get("days_in_month", 30))
 
+LAST_CITY_SUMMARY = None
+LAST_REPORT_META = None
+
 TITLE_FILL = "1F4E78"
 HEADER_FILL = "D9EAF7"
 STORE_FILL = "E2F0D9"
@@ -43,8 +46,9 @@ def tg(method, **kwargs):
 
 MAIN_KEYBOARD = {
     "keyboard": [
-        [{"text": "📊 Сделать отчет"}, {"text": "📋 Правила объединения"}],
-        [{"text": "🎯 Планы"}, {"text": "ℹ️ Помощь"}]
+        [{"text": "📊 Сделать отчет"}, {"text": "🏙 Сводка по городам"}],
+        [{"text": "📋 Правила объединения"}, {"text": "🎯 Планы"}],
+        [{"text": "ℹ️ Помощь"}]
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -362,7 +366,20 @@ def build_report(input_path, output_path):
         ))
 
     wb.save(output_path)
-    return total_fact, month_plan, forecast_total, days_fact
+
+    city_summary = {}
+    for city, d in city_agg.items():
+        p = d["plan"]
+        f = d["fact"]
+        fc = f / days_fact * DAYS_IN_MONTH if days_fact else 0
+        city_summary[city] = {
+            "plan": p,
+            "fact": f,
+            "forecast": fc,
+            "forecast_pct": (fc / p if p else 0),
+        }
+
+    return total_fact, month_plan, forecast_total, days_fact, city_summary
 
 
 @app.get("/")
@@ -384,6 +401,7 @@ def setup_webhook():
 
 @app.post("/telegram")
 def telegram_webhook():
+    global LAST_CITY_SUMMARY, LAST_REPORT_META
     update = request.get_json(silent=True) or {}
     try:
         msg = update.get("message") or {}
@@ -411,6 +429,35 @@ def telegram_webhook():
                 "Я автоматически сделаю полный отчет: сводка, города, все магазины, категории и прогноз.",
                 keyboard=True
             )
+            return "ok"
+
+        if text == "🏙 Сводка по городам":
+            if not LAST_CITY_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Пока нет свежей сводки. Сначала отправь новый Excel-файл из iiko.",
+                    keyboard=True
+                )
+                return "ok"
+
+            lines = ["🏙 Сводка по городам", ""]
+            if LAST_REPORT_META:
+                lines.append(f"Период: 1–{LAST_REPORT_META['days']} число")
+                lines.append("")
+
+            for city, d in LAST_CITY_SUMMARY.items():
+                fact = d["fact"]
+                forecast = d["forecast"]
+                pct = d["forecast_pct"]
+                fact_s = f"{fact:,.0f}".replace(",", " ")
+                forecast_s = f"{forecast:,.0f}".replace(",", " ")
+                lines.append(
+                    f"{city}:\n"
+                    f"  Факт: {fact_s} тг\n"
+                    f"  Прогноз: {forecast_s} тг ({pct:.1%})"
+                )
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
         if text == "📋 Правила объединения":
@@ -445,7 +492,8 @@ def telegram_webhook():
                 "1. Нажми «📊 Сделать отчет».\n"
                 "2. Отправь свежий файл .xlsx из iiko.\n"
                 "3. Подожди немного.\n"
-                "4. Я верну готовый Excel-отчет.\n\n"
+                "4. Я верну готовый Excel-отчет.\n"
+                "5. Потом можешь нажать «🏙 Сводка по городам» и увидеть свежие цифры прямо в Telegram.\n\n"
                 "Можно и без кнопки — просто отправить файл.",
                 keyboard=True
             )
@@ -473,8 +521,10 @@ def telegram_webhook():
             with open(inp,"wb") as f:
                 f.write(content)
 
-            total_fact, plan, forecast, days = build_report(inp, out)
+            total_fact, plan, forecast, days, city_summary = build_report(inp, out)
             pct = forecast/plan if plan else 0
+            LAST_CITY_SUMMARY = city_summary
+            LAST_REPORT_META = {"days": days}
 
             caption = (
                 f"Готово ✅\n"
