@@ -660,8 +660,6 @@ def setup_webhook():
     return f"Webhook установлен: {url} -> {result}"
 
 
-@app.post("/telegram")
-
 def process_document_in_background(chat_id, doc):
     global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY
     global LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY
@@ -772,6 +770,7 @@ def process_document_in_background(chat_id, doc):
             PROCESSING_FILE_IDS.discard(file_id)
 
 
+@app.post("/telegram")
 def telegram_webhook():
     global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT, PROCESSING_FILE_IDS
     update = request.get_json(silent=True) or {}
