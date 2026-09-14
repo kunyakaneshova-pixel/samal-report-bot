@@ -227,94 +227,130 @@ def parse_product_report(path):
 
 def parse_average_check_report(path):
     """
-    Tries two common iiko layouts:
-    1) direct 'Средний чек' column + store column
-    2) revenue + check count, then calculates revenue / checks
+    Поддерживает два формата iiko:
+
+    1) Специальный отчет по среднему чеку:
+       Торговое предприятие | Сумма со скидкой | Чеков | Средняя сумма заказа
+
+    2) Отчет по наименованиям/категориям:
+       средний чек считается по итоговой строке предприятия:
+       Сумма со скидкой / Чеков
     """
-    wb = load_workbook(path, data_only=True, read_only=True)
+    wb = load_workbook(path, data_only=True, read_only=False)
     ws = wb[wb.sheetnames[0]]
 
     header_row = None
-    avg_col = None
-    store_col = None
-    checks_col = None
+    enterprise_col = None
     revenue_col = None
+    checks_col = None
+    avg_col = None
 
-    for r in range(1, min(ws.max_row, 40) + 1):
-        row_vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 30) + 1)]
-        labels = [str(v).strip().lower() if v is not None else "" for v in row_vals]
+    for r in range(1, min(ws.max_row, 50) + 1):
+        ent = rev = chk = avg = None
 
-        possible_avg = next((i+1 for i,v in enumerate(labels) if "средн" in v and "чек" in v), None)
-        possible_store = next((i+1 for i,v in enumerate(labels)
-                               if any(k in v for k in ["торговое предприятие","магазин","ресторан","точка"])
-                               and "группа" not in v), None)
-        possible_checks = next((i+1 for i,v in enumerate(labels)
-                                if "кол" in v and "чек" in v), None)
-        possible_revenue = next((i+1 for i,v in enumerate(labels)
-                                 if any(k in v for k in ["выручка","сумма со скидкой","продажи"])
-                                 and "чек" not in v), None)
+        for c in range(1, min(ws.max_column, 30) + 1):
+            v = ws.cell(r, c).value
+            if v is None:
+                continue
+            label = str(v).strip().lower()
 
-        if possible_store and (possible_avg or (possible_checks and possible_revenue)):
+            if "торговое предприятие" in label:
+                ent = c
+            elif "сумма со скидкой" in label:
+                rev = c
+            elif label == "чеков" or ("чек" in label and "кол" in label):
+                chk = c
+            elif "средняя сумма заказа" in label or ("средн" in label and "чек" in label):
+                avg = c
+
+        if ent and rev and chk:
             header_row = r
-            avg_col = possible_avg
-            store_col = possible_store
-            checks_col = possible_checks
-            revenue_col = possible_revenue
+            enterprise_col = ent
+            revenue_col = rev
+            checks_col = chk
+            avg_col = avg
             break
 
     if not header_row:
         return None
 
-    data = {}
+    result = {}
+
+    # Формат 1: отдельный отчет среднего чека — одна строка = один магазин
+    if avg_col:
+        for r in range(header_row + 1, ws.max_row + 1):
+            enterprise = ws.cell(r, enterprise_col).value
+            revenue = ws.cell(r, revenue_col).value
+            checks = ws.cell(r, checks_col).value
+            avg_check = ws.cell(r, avg_col).value
+
+            if not enterprise:
+                continue
+
+            enterprise = str(enterprise).strip()
+            if enterprise.lower() in ("итого", "всего") or enterprise.lower().endswith(" всего"):
+                continue
+
+            try:
+                revenue = float(revenue)
+                checks = float(checks)
+                avg_check = float(avg_check)
+            except (TypeError, ValueError):
+                continue
+
+            if checks <= 0:
+                continue
+
+            store = _display_store_from_enterprise(enterprise)
+
+            result[store] = {
+                "avg_check": avg_check,
+                "checks": checks,
+                "revenue": revenue,
+                "raw_store": enterprise,
+            }
+
+        return result if result else None
+
+    # Формат 2: отчет по наименованиям — берём итоговую строку магазина
     for r in range(header_row + 1, ws.max_row + 1):
-        store = ws.cell(r, store_col).value
-        if not store:
-            continue
-        store = str(store).strip()
-        if not store or store.lower() in ["итого", "всего"]:
+        enterprise = ws.cell(r, enterprise_col).value
+        if not enterprise:
             continue
 
-        avg = None
-        checks = None
-        revenue = None
+        enterprise = str(enterprise).strip()
 
-        try:
-            if avg_col:
-                v = ws.cell(r, avg_col).value
-                if v is not None:
-                    avg = float(v)
-        except Exception:
-            pass
-
-        try:
-            if checks_col:
-                v = ws.cell(r, checks_col).value
-                if v is not None:
-                    checks = float(v)
-        except Exception:
-            pass
-
-        try:
-            if revenue_col:
-                v = ws.cell(r, revenue_col).value
-                if v is not None:
-                    revenue = float(v)
-        except Exception:
-            pass
-
-        if avg is None and checks and revenue is not None and checks > 0:
-            avg = revenue / checks
-
-        if avg is None:
+        if not enterprise.lower().endswith(" всего"):
             continue
 
-        data[store] = {
-            "avg_check": avg,
+        group_value = ws.cell(r, 2).value
+        dish_value = ws.cell(r, 3).value
+        if group_value is not None or dish_value is not None:
+            continue
+
+        revenue = ws.cell(r, revenue_col).value
+        checks = ws.cell(r, checks_col).value
+
+        try:
+            revenue = float(revenue)
+            checks = float(checks)
+        except (TypeError, ValueError):
+            continue
+
+        if checks <= 0:
+            continue
+
+        raw_store = enterprise[:-6].strip()
+        store = _display_store_from_enterprise(raw_store)
+
+        result[store] = {
+            "avg_check": revenue / checks,
             "checks": checks,
             "revenue": revenue,
+            "raw_store": raw_store,
         }
 
-    return data if data else None
+    return result if result else None
 
 
 def analyze(path):
@@ -1126,23 +1162,33 @@ def telegram_webhook():
                 f.write(content)
 
             product_summary, product_city_summary = parse_product_report(inp)
+            avg_check_summary = parse_average_check_report(inp)
+
             if product_summary:
                 LAST_PRODUCT_SUMMARY = product_summary
                 LAST_PRODUCT_CITY_SUMMARY = product_city_summary
-                send_message(
-                    chat_id,
+                if avg_check_summary:
+                    LAST_AVG_CHECK_SUMMARY = avg_check_summary
+
+                message = (
                     "Файл по наименованиям обработан ✅\n"
-                    "Теперь доступны «🔥 Топ продукции», «🐢 Слабые позиции» и «🏙 Топ продукции по городам».",
-                    keyboard=True
+                    "Доступны: «🔥 Топ продукции», «🐢 Слабые позиции», "
+                    "«🏙 Топ продукции по городам»"
                 )
+                if avg_check_summary:
+                    message += " и «🧾 Средний чек»."
+                else:
+                    message += "."
+
+                send_message(chat_id, message, keyboard=True)
                 return "ok"
 
-            avg_check_summary = parse_average_check_report(inp)
             if avg_check_summary:
                 LAST_AVG_CHECK_SUMMARY = avg_check_summary
                 send_message(
                     chat_id,
-                    "Данные по среднему чеку обработаны ✅\n"
+                    f"Отчет по среднему чеку обработан ✅\n"
+                    f"Найдено магазинов: {len(avg_check_summary)}\n\n"
                     "Теперь нажми «🧾 Средний чек».",
                     keyboard=True
                 )
