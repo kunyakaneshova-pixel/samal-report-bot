@@ -31,6 +31,7 @@ LAST_CITY_SUMMARY = None
 LAST_STORE_SUMMARY = None
 LAST_CATEGORY_SUMMARY = None
 LAST_PRODUCT_SUMMARY = None
+LAST_PRODUCT_CITY_SUMMARY = None
 LAST_AVG_CHECK_SUMMARY = None
 LAST_REPORT_META = None
 LAST_REPORT_SNAPSHOT = None
@@ -55,7 +56,9 @@ MAIN_KEYBOARD = {
         [{"text": "📊 Сделать отчет"}, {"text": "🏙 Сводка по городам"}],
         [{"text": "🏆 Лучшие магазины"}, {"text": "⚠️ Отстающие магазины"}],
         [{"text": "📈 Лучшие категории"}, {"text": "📉 Отстающие категории"}],
+        [{"text": "🚀 Рост за день"}, {"text": "🏙 Рост по городам"}],
         [{"text": "🔥 Топ продукции"}, {"text": "🐢 Слабые позиции"}],
+        [{"text": "🏙 Топ продукции по городам"}],
         [{"text": "🧾 Средний чек"}, {"text": "↔️ Сравнить со вчера"}],
         [{"text": "📋 Правила объединения"}, {"text": "🎯 Планы"}],
         [{"text": "ℹ️ Помощь"}]
@@ -131,13 +134,27 @@ def parse_iiko(path):
 
 
 
+def _city_from_enterprise(enterprise):
+    s = (enterprise or "").lower()
+    if "astana" in s:
+        return "Астана"
+    if "uralsk" in s:
+        return "Уральск"
+    if "kyzyl" in s or "qyzyl" in s or "кызыл" in s:
+        return "Кызылорда"
+    if "kostan" in s or "костан" in s:
+        return "Костанай"
+    if "aktobe" in s or "актоб" in s or s.startswith("z-aktobe"):
+        return "Ақтөбе"
+    return "Прочие"
+
+
 def parse_product_report(path):
-    # Файл продукции из iiko: ищем заголовки "Блюдо", "Количество блюд",
-    # "Сумма со скидкой". Заголовок обычно находится не в первой строке.
     wb = load_workbook(path, data_only=True, read_only=False)
     ws = wb[wb.sheetnames[0]]
 
     header_row = None
+    enterprise_col = None
     dish_col = None
     qty_col = None
     revenue_col = None
@@ -148,35 +165,41 @@ def parse_product_report(path):
             value = ws.cell(r, c).value
             if value is None:
                 continue
-            label = str(value).strip().lower()
-            labels[c] = label
+            labels[c] = str(value).strip().lower()
 
         for c, label in labels.items():
-            if label == "блюдо":
+            if "торговое предприятие" in label:
+                enterprise_col = c
+            elif label == "блюдо":
                 dish_col = c
             elif "количество блюд" in label:
                 qty_col = c
             elif "сумма со скидкой" in label:
                 revenue_col = c
 
-        if dish_col and qty_col and revenue_col:
+        if enterprise_col and dish_col and qty_col and revenue_col:
             header_row = r
             break
 
-        # reset for next row
-        dish_col = qty_col = revenue_col = None
+        enterprise_col = dish_col = qty_col = revenue_col = None
 
     if not header_row:
-        return None
+        return None, None
 
     products = defaultdict(lambda: {"qty": 0.0, "revenue": 0.0})
+    city_products = defaultdict(lambda: defaultdict(lambda: {"qty": 0.0, "revenue": 0.0}))
+
+    current_enterprise = None
 
     for r in range(header_row + 1, ws.max_row + 1):
+        enterprise = ws.cell(r, enterprise_col).value
+        if enterprise:
+            current_enterprise = str(enterprise).strip()
+
         dish = ws.cell(r, dish_col).value
         qty = ws.cell(r, qty_col).value
         revenue = ws.cell(r, revenue_col).value
 
-        # Строки "всего" не имеют названия блюда, поэтому автоматически пропускаются.
         if dish is None or qty is None or revenue is None:
             continue
 
@@ -193,7 +216,13 @@ def parse_product_report(path):
         products[name]["qty"] += qty
         products[name]["revenue"] += revenue
 
-    return dict(products) if products else None
+        city = _city_from_enterprise(current_enterprise)
+        city_products[city][name]["qty"] += qty
+        city_products[city][name]["revenue"] += revenue
+
+    overall = dict(products) if products else None
+    by_city = {city: dict(items) for city, items in city_products.items()} if city_products else None
+    return overall, by_city
 
 
 def parse_average_check_report(path):
@@ -595,7 +624,7 @@ def setup_webhook():
 
 @app.post("/telegram")
 def telegram_webhook():
-    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT
+    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT
     update = request.get_json(silent=True) or {}
     try:
         msg = update.get("message") or {}
@@ -748,6 +777,113 @@ def telegram_webhook():
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
+        if text == "🚀 Рост за день":
+            if not LAST_REPORT_SNAPSHOT or not PREVIOUS_REPORT_SNAPSHOT:
+                send_message(
+                    chat_id,
+                    "Для роста за день мне нужны два последовательных отчета: вчерашний и сегодняшний.",
+                    keyboard=True
+                )
+                return "ok"
+
+            cur = LAST_REPORT_SNAPSHOT
+            prev = PREVIOUS_REPORT_SNAPSHOT
+
+            if cur["days"] <= prev["days"]:
+                send_message(
+                    chat_id,
+                    "Сначала отправь более свежий отчет за следующий день.",
+                    keyboard=True
+                )
+                return "ok"
+
+            store_changes = []
+            for store, cur_fact in cur["store_facts"].items():
+                prev_fact = prev["store_facts"].get(store, 0)
+                store_changes.append((store, cur_fact - prev_fact))
+            store_changes.sort(key=lambda x: x[1], reverse=True)
+
+            cat_changes = []
+            for cat, cur_fact in cur["category_facts"].items():
+                prev_fact = prev["category_facts"].get(cat, 0)
+                cat_changes.append((cat, cur_fact - prev_fact))
+            cat_changes.sort(key=lambda x: x[1], reverse=True)
+
+            total_add = cur["total_fact"] - prev["total_fact"]
+            total_add_s = f"{total_add:,.0f}".replace(",", " ")
+
+            lines = [
+                f"🚀 Рост за день: {prev['days']} → {cur['days']} сентября",
+                "",
+                f"Продажи за день: {total_add_s} тг",
+                "",
+                "🏆 Топ-10 магазинов за день:"
+            ]
+            for i, (store, delta) in enumerate(store_changes[:10], 1):
+                delta_s = f"{delta:,.0f}".replace(",", " ")
+                share = delta / total_add if total_add else 0
+                lines.append(f"{i}. {store} — {delta_s} тг ({share:.1%} дня)")
+
+            lines += ["", "📈 Топ категорий за день:"]
+            for i, (cat, delta) in enumerate(cat_changes, 1):
+                delta_s = f"{delta:,.0f}".replace(",", " ")
+                share = delta / total_add if total_add else 0
+                lines.append(f"{i}. {cat} — {delta_s} тг ({share:.1%} дня)")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "🏙 Рост по городам":
+            if not LAST_REPORT_SNAPSHOT or not PREVIOUS_REPORT_SNAPSHOT:
+                send_message(
+                    chat_id,
+                    "Для роста по городам мне нужны два последовательных отчета: вчерашний и сегодняшний.",
+                    keyboard=True
+                )
+                return "ok"
+
+            cur = LAST_REPORT_SNAPSHOT
+            prev = PREVIOUS_REPORT_SNAPSHOT
+
+            if cur["days"] <= prev["days"]:
+                send_message(
+                    chat_id,
+                    "Сначала отправь более свежий отчет за следующий день.",
+                    keyboard=True
+                )
+                return "ok"
+
+            cur_cities = cur.get("city_facts", {})
+            prev_cities = prev.get("city_facts", {})
+
+            if not cur_cities:
+                send_message(
+                    chat_id,
+                    "В сохраненном отчете пока нет разбивки по городам. Отправь два новых последовательных отчета после этого обновления.",
+                    keyboard=True
+                )
+                return "ok"
+
+            city_changes = []
+            for city, cur_fact in cur_cities.items():
+                prev_fact = prev_cities.get(city, 0)
+                city_changes.append((city, cur_fact - prev_fact))
+            city_changes.sort(key=lambda x: x[1], reverse=True)
+
+            total_add = cur["total_fact"] - prev["total_fact"]
+
+            lines = [
+                f"🏙 Рост по городам: {prev['days']} → {cur['days']} сентября",
+                ""
+            ]
+            for i, (city, delta) in enumerate(city_changes, 1):
+                delta_s = f"{delta:,.0f}".replace(",", " ")
+                share = delta / total_add if total_add else 0
+                lines.append(f"{i}. {city} — +{delta_s} тг | {share:.1%} продаж дня")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
         if text == "↔️ Сравнить со вчера":
             if not LAST_REPORT_SNAPSHOT or not PREVIOUS_REPORT_SNAPSHOT:
                 send_message(
@@ -804,6 +940,19 @@ def telegram_webhook():
                 delta_s = f"{delta:,.0f}".replace(",", " ")
                 lines.append(f"{i}. {cat}: +{delta_s} тг")
 
+            cur_cities = cur.get("city_facts", {})
+            prev_cities = prev.get("city_facts", {})
+            if cur_cities:
+                city_changes = []
+                for city, cur_fact in cur_cities.items():
+                    city_changes.append((city, cur_fact - prev_cities.get(city, 0)))
+                city_changes.sort(key=lambda x: x[1], reverse=True)
+
+                lines.extend(["", "🏙 По городам за новый день:"])
+                for i, (city, delta) in enumerate(city_changes, 1):
+                    delta_s = f"{delta:,.0f}".replace(",", " ")
+                    lines.append(f"{i}. {city}: +{delta_s} тг")
+
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
@@ -850,6 +999,39 @@ def telegram_webhook():
                 rev = f"{d['revenue']:,.0f}".replace(",", " ")
                 qty = f"{d['qty']:,.0f}".replace(",", " ")
                 lines.append(f"{i}. {name} — {qty} шт. | {rev} тг")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "🏙 Топ продукции по городам":
+            if not LAST_PRODUCT_CITY_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Пока нет данных по продукции по городам. Сначала отправь файл iiko «по наименованиям.xlsx».",
+                    keyboard=True
+                )
+                return "ok"
+
+            city_order = ["Ақтөбе", "Уральск", "Астана", "Кызылорда", "Костанай"]
+            lines = ["🏙 Топ продукции по городам", ""]
+
+            for city in city_order:
+                products = LAST_PRODUCT_CITY_SUMMARY.get(city, {})
+                if not products:
+                    continue
+
+                ranked = sorted(
+                    products.items(),
+                    key=lambda x: x[1]["revenue"],
+                    reverse=True
+                )[:10]
+
+                lines.append(f"📍 {city}")
+                for i, (name, d) in enumerate(ranked, 1):
+                    rev = f"{d['revenue']:,.0f}".replace(",", " ")
+                    qty = f"{d['qty']:,.0f}".replace(",", " ")
+                    lines.append(f"{i}. {name} — {rev} тг | {qty} шт.")
+                lines.append("")
 
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
@@ -943,13 +1125,14 @@ def telegram_webhook():
             with open(inp,"wb") as f:
                 f.write(content)
 
-            product_summary = parse_product_report(inp)
+            product_summary, product_city_summary = parse_product_report(inp)
             if product_summary:
                 LAST_PRODUCT_SUMMARY = product_summary
+                LAST_PRODUCT_CITY_SUMMARY = product_city_summary
                 send_message(
                     chat_id,
                     "Файл по наименованиям обработан ✅\n"
-                    "Теперь нажми «🔥 Топ продукции» или «🐢 Слабые позиции».",
+                    "Теперь доступны «🔥 Топ продукции», «🐢 Слабые позиции» и «🏙 Топ продукции по городам».",
                     keyboard=True
                 )
                 return "ok"
@@ -972,11 +1155,16 @@ def telegram_webhook():
             LAST_CATEGORY_SUMMARY = category_summary
             LAST_REPORT_META = {"days": days}
 
+            city_facts_snapshot = {}
+            for city, d in city_summary.items():
+                city_facts_snapshot[city] = d["fact"]
+
             current_snapshot = {
                 "days": days,
                 "total_fact": total_fact,
                 "store_facts": {k: v["fact"] for k, v in store_summary.items()},
                 "category_facts": {k: v["fact"] for k, v in category_summary.items()},
+                "city_facts": city_facts_snapshot,
             }
 
             if LAST_REPORT_SNAPSHOT is None:
