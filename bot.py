@@ -227,6 +227,25 @@ def parse_product_report(path):
     return overall, by_city
 
 
+def _display_store_from_enterprise(enterprise):
+    """
+    Преобразует сырое название торгового предприятия iiko
+    в название магазина из config.json, если соответствие однозначное.
+    Если одно предприятие соответствует нескольким точкам,
+    оставляет исходное название.
+    """
+    prefix = f"{enterprise}|||"
+    matches = sorted(set(
+        store for key, store in STORE_MAPPING.items()
+        if key.startswith(prefix)
+    ))
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return enterprise
+
+
 def parse_average_check_report(path):
     """
     Поддерживает два формата iiko:
