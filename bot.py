@@ -29,6 +29,7 @@ DAYS_IN_MONTH = int(CONFIG.get("days_in_month", 30))
 
 LAST_CITY_SUMMARY = None
 LAST_STORE_SUMMARY = None
+LAST_CATEGORY_SUMMARY = None
 LAST_REPORT_META = None
 
 TITLE_FILL = "1F4E78"
@@ -49,6 +50,7 @@ MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "📊 Сделать отчет"}, {"text": "🏙 Сводка по городам"}],
         [{"text": "🏆 Лучшие магазины"}, {"text": "⚠️ Отстающие магазины"}],
+        [{"text": "📈 Лучшие категории"}, {"text": "📉 Отстающие категории"}],
         [{"text": "📋 Правила объединения"}, {"text": "🎯 Планы"}],
         [{"text": "ℹ️ Помощь"}]
     ],
@@ -394,7 +396,20 @@ def build_report(input_path, output_path):
             "deviation": fc - p,
         }
 
-    return total_fact, month_plan, forecast_total, days_fact, city_summary, store_summary
+    category_summary = {}
+    for cat in CATEGORIES:
+        p = cat_plan[cat]
+        f = cat_fact[cat]
+        fc = f / days_fact * DAYS_IN_MONTH if days_fact else 0
+        category_summary[cat] = {
+            "plan": p,
+            "fact": f,
+            "forecast": fc,
+            "forecast_pct": (fc / p if p else 0),
+            "deviation": fc - p,
+        }
+
+    return total_fact, month_plan, forecast_total, days_fact, city_summary, store_summary, category_summary
 
 
 @app.get("/")
@@ -416,7 +431,7 @@ def setup_webhook():
 
 @app.post("/telegram")
 def telegram_webhook():
-    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_REPORT_META
+    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_REPORT_META
     update = request.get_json(silent=True) or {}
     try:
         msg = update.get("message") or {}
@@ -522,6 +537,53 @@ def telegram_webhook():
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
+        if text == "📈 Лучшие категории":
+            if not LAST_CATEGORY_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Пока нет свежих данных. Сначала отправь новый Excel-файл из iiko.",
+                    keyboard=True
+                )
+                return "ok"
+
+            ranked = sorted(
+                LAST_CATEGORY_SUMMARY.items(),
+                key=lambda x: x[1]["forecast_pct"],
+                reverse=True
+            )
+
+            lines = ["📈 Лучшие категории по прогнозу выполнения плана", ""]
+            for i, (cat, d) in enumerate(ranked, 1):
+                pct = d["forecast_pct"]
+                forecast_s = f"{d['forecast']:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {cat} — {pct:.1%} | прогноз {forecast_s} тг")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "📉 Отстающие категории":
+            if not LAST_CATEGORY_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Пока нет свежих данных. Сначала отправь новый Excel-файл из iiko.",
+                    keyboard=True
+                )
+                return "ok"
+
+            ranked = sorted(
+                LAST_CATEGORY_SUMMARY.items(),
+                key=lambda x: x[1]["forecast_pct"]
+            )
+
+            lines = ["📉 Отстающие категории по прогнозу выполнения плана", ""]
+            for i, (cat, d) in enumerate(ranked, 1):
+                pct = d["forecast_pct"]
+                deviation_s = f"{d['deviation']:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {cat} — {pct:.1%} | отклонение {deviation_s} тг")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
         if text == "📋 Правила объединения":
             rules = (
                 "Правила объединения категорий:\n\n"
@@ -555,7 +617,7 @@ def telegram_webhook():
                 "2. Отправь свежий файл .xlsx из iiko.\n"
                 "3. Подожди немного.\n"
                 "4. Я верну готовый Excel-отчет.\n"
-                "5. Потом можешь смотреть города, лучшие и отстающие магазины прямо в Telegram.\n\n"
+                "5. Потом можешь смотреть города, магазины и категории прямо в Telegram.\n\n"
                 "Можно и без кнопки — просто отправить файл.",
                 keyboard=True
             )
@@ -583,10 +645,11 @@ def telegram_webhook():
             with open(inp,"wb") as f:
                 f.write(content)
 
-            total_fact, plan, forecast, days, city_summary, store_summary = build_report(inp, out)
+            total_fact, plan, forecast, days, city_summary, store_summary, category_summary = build_report(inp, out)
             pct = forecast/plan if plan else 0
             LAST_CITY_SUMMARY = city_summary
             LAST_STORE_SUMMARY = store_summary
+            LAST_CATEGORY_SUMMARY = category_summary
             LAST_REPORT_META = {"days": days}
 
             caption = (
