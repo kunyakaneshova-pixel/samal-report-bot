@@ -30,7 +30,11 @@ DAYS_IN_MONTH = int(CONFIG.get("days_in_month", 30))
 LAST_CITY_SUMMARY = None
 LAST_STORE_SUMMARY = None
 LAST_CATEGORY_SUMMARY = None
+LAST_PRODUCT_SUMMARY = None
+LAST_AVG_CHECK_SUMMARY = None
 LAST_REPORT_META = None
+LAST_REPORT_SNAPSHOT = None
+PREVIOUS_REPORT_SNAPSHOT = None
 
 TITLE_FILL = "1F4E78"
 HEADER_FILL = "D9EAF7"
@@ -51,6 +55,8 @@ MAIN_KEYBOARD = {
         [{"text": "📊 Сделать отчет"}, {"text": "🏙 Сводка по городам"}],
         [{"text": "🏆 Лучшие магазины"}, {"text": "⚠️ Отстающие магазины"}],
         [{"text": "📈 Лучшие категории"}, {"text": "📉 Отстающие категории"}],
+        [{"text": "🔥 Топ продукции"}, {"text": "🐢 Слабые позиции"}],
+        [{"text": "🧾 Средний чек"}, {"text": "↔️ Сравнить со вчера"}],
         [{"text": "📋 Правила объединения"}, {"text": "🎯 Планы"}],
         [{"text": "ℹ️ Помощь"}]
     ],
@@ -122,6 +128,164 @@ def parse_iiko(path):
         blocks.append((enterprise, subgroup, items))
 
     return blocks, day_end, month, year
+
+
+
+def parse_product_report(path):
+    # Файл продукции из iiko: ищем заголовки "Блюдо", "Количество блюд",
+    # "Сумма со скидкой". Заголовок обычно находится не в первой строке.
+    wb = load_workbook(path, data_only=True, read_only=False)
+    ws = wb[wb.sheetnames[0]]
+
+    header_row = None
+    dish_col = None
+    qty_col = None
+    revenue_col = None
+
+    for r in range(1, min(ws.max_row, 50) + 1):
+        labels = {}
+        for c in range(1, min(ws.max_column, 30) + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            label = str(value).strip().lower()
+            labels[c] = label
+
+        for c, label in labels.items():
+            if label == "блюдо":
+                dish_col = c
+            elif "количество блюд" in label:
+                qty_col = c
+            elif "сумма со скидкой" in label:
+                revenue_col = c
+
+        if dish_col and qty_col and revenue_col:
+            header_row = r
+            break
+
+        # reset for next row
+        dish_col = qty_col = revenue_col = None
+
+    if not header_row:
+        return None
+
+    products = defaultdict(lambda: {"qty": 0.0, "revenue": 0.0})
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        dish = ws.cell(r, dish_col).value
+        qty = ws.cell(r, qty_col).value
+        revenue = ws.cell(r, revenue_col).value
+
+        # Строки "всего" не имеют названия блюда, поэтому автоматически пропускаются.
+        if dish is None or qty is None or revenue is None:
+            continue
+
+        name = str(dish).strip()
+        if not name:
+            continue
+
+        try:
+            qty = float(qty)
+            revenue = float(revenue)
+        except (TypeError, ValueError):
+            continue
+
+        products[name]["qty"] += qty
+        products[name]["revenue"] += revenue
+
+    return dict(products) if products else None
+
+
+def parse_average_check_report(path):
+    """
+    Tries two common iiko layouts:
+    1) direct 'Средний чек' column + store column
+    2) revenue + check count, then calculates revenue / checks
+    """
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    header_row = None
+    avg_col = None
+    store_col = None
+    checks_col = None
+    revenue_col = None
+
+    for r in range(1, min(ws.max_row, 40) + 1):
+        row_vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 30) + 1)]
+        labels = [str(v).strip().lower() if v is not None else "" for v in row_vals]
+
+        possible_avg = next((i+1 for i,v in enumerate(labels) if "средн" in v and "чек" in v), None)
+        possible_store = next((i+1 for i,v in enumerate(labels)
+                               if any(k in v for k in ["торговое предприятие","магазин","ресторан","точка"])
+                               and "группа" not in v), None)
+        possible_checks = next((i+1 for i,v in enumerate(labels)
+                                if "кол" in v and "чек" in v), None)
+        possible_revenue = next((i+1 for i,v in enumerate(labels)
+                                 if any(k in v for k in ["выручка","сумма со скидкой","продажи"])
+                                 and "чек" not in v), None)
+
+        if possible_store and (possible_avg or (possible_checks and possible_revenue)):
+            header_row = r
+            avg_col = possible_avg
+            store_col = possible_store
+            checks_col = possible_checks
+            revenue_col = possible_revenue
+            break
+
+    if not header_row:
+        return None
+
+    data = {}
+    for r in range(header_row + 1, ws.max_row + 1):
+        store = ws.cell(r, store_col).value
+        if not store:
+            continue
+        store = str(store).strip()
+        if not store or store.lower() in ["итого", "всего"]:
+            continue
+
+        avg = None
+        checks = None
+        revenue = None
+
+        try:
+            if avg_col:
+                v = ws.cell(r, avg_col).value
+                if v is not None:
+                    avg = float(v)
+        except Exception:
+            pass
+
+        try:
+            if checks_col:
+                v = ws.cell(r, checks_col).value
+                if v is not None:
+                    checks = float(v)
+        except Exception:
+            pass
+
+        try:
+            if revenue_col:
+                v = ws.cell(r, revenue_col).value
+                if v is not None:
+                    revenue = float(v)
+        except Exception:
+            pass
+
+        if avg is None and checks and revenue is not None and checks > 0:
+            avg = revenue / checks
+
+        if avg is None:
+            continue
+
+        data[store] = {
+            "avg_check": avg,
+            "checks": checks,
+            "revenue": revenue,
+        }
+
+    return data if data else None
 
 
 def analyze(path):
@@ -431,7 +595,7 @@ def setup_webhook():
 
 @app.post("/telegram")
 def telegram_webhook():
-    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_REPORT_META
+    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT
     update = request.get_json(silent=True) or {}
     try:
         msg = update.get("message") or {}
@@ -584,6 +748,140 @@ def telegram_webhook():
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
+        if text == "↔️ Сравнить со вчера":
+            if not LAST_REPORT_SNAPSHOT or not PREVIOUS_REPORT_SNAPSHOT:
+                send_message(
+                    chat_id,
+                    "Для сравнения мне нужны два последовательных отчета.\n"
+                    "Сначала отправь вчерашний файл, потом сегодняшний. После этого нажми эту кнопку.",
+                    keyboard=True
+                )
+                return "ok"
+
+            cur = LAST_REPORT_SNAPSHOT
+            prev = PREVIOUS_REPORT_SNAPSHOT
+
+            if cur["days"] <= prev["days"]:
+                send_message(
+                    chat_id,
+                    "Не вижу более нового отчета. Отправь файл за следующий день и попробуй снова.",
+                    keyboard=True
+                )
+                return "ok"
+
+            total_add = cur["total_fact"] - prev["total_fact"]
+            pct_add = (total_add / prev["total_fact"]) if prev["total_fact"] else 0
+
+            store_changes = []
+            for store, cur_fact in cur["store_facts"].items():
+                prev_fact = prev["store_facts"].get(store, 0)
+                store_changes.append((store, cur_fact - prev_fact))
+            store_changes.sort(key=lambda x: x[1], reverse=True)
+
+            cat_changes = []
+            for cat, cur_fact in cur["category_facts"].items():
+                prev_fact = prev["category_facts"].get(cat, 0)
+                cat_changes.append((cat, cur_fact - prev_fact))
+            cat_changes.sort(key=lambda x: x[1], reverse=True)
+
+            total_add_s = f"{total_add:,.0f}".replace(",", " ")
+
+            lines = [
+                f"↔️ Сравнение: 1–{prev['days']} → 1–{cur['days']}",
+                "",
+                f"Продажи за новый день: +{total_add_s} тг",
+                f"Рост накопительного факта: {pct_add:.1%}",
+                "",
+                "🏆 Больше всего добавили магазины:"
+            ]
+
+            for i, (store, delta) in enumerate(store_changes[:5], 1):
+                delta_s = f"{delta:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {store}: +{delta_s} тг")
+
+            lines.extend(["", "📈 Больше всего добавили категории:"])
+            for i, (cat, delta) in enumerate(cat_changes[:5], 1):
+                delta_s = f"{delta:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {cat}: +{delta_s} тг")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "🔥 Топ продукции":
+            if not LAST_PRODUCT_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Пока нет данных по продукции. Отправь файл iiko «по наименованиям.xlsx».",
+                    keyboard=True
+                )
+                return "ok"
+
+            ranked = sorted(
+                LAST_PRODUCT_SUMMARY.items(),
+                key=lambda x: x[1]["revenue"],
+                reverse=True
+            )[:15]
+
+            lines = ["🔥 Топ-15 продукции по выручке", ""]
+            for i, (name, d) in enumerate(ranked, 1):
+                rev = f"{d['revenue']:,.0f}".replace(",", " ")
+                qty = f"{d['qty']:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {name} — {rev} тг | {qty} шт.")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "🐢 Слабые позиции":
+            if not LAST_PRODUCT_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Пока нет данных по продукции. Отправь файл iiko «по наименованиям.xlsx».",
+                    keyboard=True
+                )
+                return "ok"
+
+            ranked = sorted(
+                [(name, d) for name, d in LAST_PRODUCT_SUMMARY.items() if d["qty"] > 0],
+                key=lambda x: (x[1]["qty"], x[1]["revenue"])
+            )[:15]
+
+            lines = ["🐢 15 самых слабых позиций по количеству продаж", ""]
+            for i, (name, d) in enumerate(ranked, 1):
+                rev = f"{d['revenue']:,.0f}".replace(",", " ")
+                qty = f"{d['qty']:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {name} — {qty} шт. | {rev} тг")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+        if text == "🧾 Средний чек":
+            if not LAST_AVG_CHECK_SUMMARY:
+                send_message(
+                    chat_id,
+                    "Для среднего чека мне нужна выгрузка iiko, где есть «Средний чек» или одновременно «Количество чеков» и «Выручка». Отправь такой .xlsx — я запомню данные.",
+                    keyboard=True
+                )
+                return "ok"
+
+            ranked = sorted(
+                LAST_AVG_CHECK_SUMMARY.items(),
+                key=lambda x: x[1]["avg_check"],
+                reverse=True
+            )
+
+            lines = ["🧾 Средний чек по точкам", "", "🏆 Самый высокий:"]
+            for i, (store, d) in enumerate(ranked[:10], 1):
+                avg_s = f"{d['avg_check']:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {store} — {avg_s} тг")
+
+            lines += ["", "⚠️ Самый низкий:"]
+            for i, (store, d) in enumerate(list(reversed(ranked[-10:])), 1):
+                avg_s = f"{d['avg_check']:,.0f}".replace(",", " ")
+                lines.append(f"{i}. {store} — {avg_s} тг")
+
+            send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
         if text == "📋 Правила объединения":
             rules = (
                 "Правила объединения категорий:\n\n"
@@ -617,7 +915,7 @@ def telegram_webhook():
                 "2. Отправь свежий файл .xlsx из iiko.\n"
                 "3. Подожди немного.\n"
                 "4. Я верну готовый Excel-отчет.\n"
-                "5. Потом можешь смотреть города, магазины и категории прямо в Telegram.\n\n"
+                "5. Потом можешь смотреть города, магазины, категории и сравнение со вчера прямо в Telegram.\n\n"
                 "Можно и без кнопки — просто отправить файл.",
                 keyboard=True
             )
@@ -645,12 +943,51 @@ def telegram_webhook():
             with open(inp,"wb") as f:
                 f.write(content)
 
+            product_summary = parse_product_report(inp)
+            if product_summary:
+                LAST_PRODUCT_SUMMARY = product_summary
+                send_message(
+                    chat_id,
+                    "Файл по наименованиям обработан ✅\n"
+                    "Теперь нажми «🔥 Топ продукции» или «🐢 Слабые позиции».",
+                    keyboard=True
+                )
+                return "ok"
+
+            avg_check_summary = parse_average_check_report(inp)
+            if avg_check_summary:
+                LAST_AVG_CHECK_SUMMARY = avg_check_summary
+                send_message(
+                    chat_id,
+                    "Данные по среднему чеку обработаны ✅\n"
+                    "Теперь нажми «🧾 Средний чек».",
+                    keyboard=True
+                )
+                return "ok"
+
             total_fact, plan, forecast, days, city_summary, store_summary, category_summary = build_report(inp, out)
             pct = forecast/plan if plan else 0
             LAST_CITY_SUMMARY = city_summary
             LAST_STORE_SUMMARY = store_summary
             LAST_CATEGORY_SUMMARY = category_summary
             LAST_REPORT_META = {"days": days}
+
+            current_snapshot = {
+                "days": days,
+                "total_fact": total_fact,
+                "store_facts": {k: v["fact"] for k, v in store_summary.items()},
+                "category_facts": {k: v["fact"] for k, v in category_summary.items()},
+            }
+
+            if LAST_REPORT_SNAPSHOT is None:
+                LAST_REPORT_SNAPSHOT = current_snapshot
+            elif days > LAST_REPORT_SNAPSHOT.get("days", 0):
+                PREVIOUS_REPORT_SNAPSHOT = LAST_REPORT_SNAPSHOT
+                LAST_REPORT_SNAPSHOT = current_snapshot
+            elif days == LAST_REPORT_SNAPSHOT.get("days", 0):
+                LAST_REPORT_SNAPSHOT = current_snapshot
+            else:
+                PREVIOUS_REPORT_SNAPSHOT = current_snapshot
 
             caption = (
                 f"Готово ✅\n"
