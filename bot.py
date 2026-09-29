@@ -440,7 +440,7 @@ def build_report(input_path, output_path):
     ws_rules = wb.create_sheet("Объединения")
 
     # Summary
-    style_title(ws_sum, "A1:H1", f"Продажи SamalCakes — отчет за 1–{days_fact:02d}.{month:02d}.{year}")
+    style_title(ws_sum, "A1:I1", f"Продажи SamalCakes — отчет за 1–{days_fact:02d}.{month:02d}.{year}")
     ws_sum.append([])
     ws_sum.append(["Показатель","Значение"])
     style_header(ws_sum[3])
@@ -462,14 +462,15 @@ def build_report(input_path, output_path):
         ws_sum[f"B{r}"].number_format = '0.0%'
 
     # City summary
-    city_agg = defaultdict(lambda: {"plan":0.0,"fact":0.0})
+    city_agg = defaultdict(lambda: {"plan":0.0,"fact":0.0,"store_count":0})
     for store in PLANS:
         city=store.split("/")[0]
         city_agg[city]["plan"] += PLANS[store]["plan"]
         city_agg[city]["fact"] += store_facts[store]
+        city_agg[city]["store_count"] += 1
 
-    style_title(ws_sum, "A14:H14", "Сводка по городам")
-    headers=["Город","План, тг","Факт, тг","Выполнение","Прогноз, тг","Прогноз, %","Отклонение, тг","Доля факта"]
+    style_title(ws_sum, "A14:I14", "Сводка по городам")
+    headers=["Город","План, тг","Факт, тг","Выполнение","Прогноз, тг","Прогноз, %","Отклонение, тг","Доля факта","Количество магазинов"]
     for col, h in enumerate(headers,1):
         ws_sum.cell(15,col,h)
     style_header(ws_sum[15])
@@ -477,10 +478,16 @@ def build_report(input_path, output_path):
     rr=16
     for city, d in city_agg.items():
         p=d["plan"]; f=d["fact"]; fc=f/days_fact*DAYS_IN_MONTH if days_fact else 0
-        vals=[city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0]
+        vals=[city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0,d["store_count"]]
         for c,v in enumerate(vals,1):
             ws_sum.cell(rr,c,v)
         rr += 1
+
+    ws_sum.cell(rr, 1, "Всего магазинов")
+    ws_sum.cell(rr, 9, sum(d["store_count"] for d in city_agg.values()))
+    style_header(ws_sum[rr])
+    for count_row in range(16, rr + 1):
+        ws_sum.cell(count_row, 9).number_format = '0'
 
     # Categories
     style_title(ws_cat, "A1:H1", "Сводка по категориям")
@@ -627,6 +634,7 @@ def build_report(input_path, output_path):
         f = d["fact"]
         fc = f / days_fact * DAYS_IN_MONTH if days_fact else 0
         city_summary[city] = {
+            "store_count": d["store_count"],
             "plan": p,
             "fact": f,
             "forecast": fc,
@@ -843,10 +851,13 @@ def telegram_webhook():
                 forecast_s = f"{forecast:,.0f}".replace(",", " ")
                 lines.append(
                     f"{city}:\n"
+                    f"  Количество магазинов: {d['store_count']}\n"
                     f"  Факт: {fact_s} тг\n"
                     f"  Прогноз: {forecast_s} тг ({pct:.1%})"
                 )
 
+            total_stores = sum(d["store_count"] for d in LAST_CITY_SUMMARY.values())
+            lines.append(f"\nВсего магазинов: {total_stores}")
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
