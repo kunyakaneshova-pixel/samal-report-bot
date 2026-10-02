@@ -454,6 +454,10 @@ def build_report(input_path, output_path):
     days_in_month = calendar.monthrange(year, month)[1]
 
     month_plan = sum(v["plan"] for v in PLANS.values())
+
+    # В первые 3 дня месяца простой прогноз "средний день × дни месяца"
+    # слишком нестабилен. Поэтому начинаем показывать прогноз только с 4-го дня.
+    forecast_available = days_fact >= 4
     forecast_total = total_fact / days_fact * days_in_month if days_fact else 0
 
     wb = Workbook()
@@ -467,18 +471,23 @@ def build_report(input_path, output_path):
     ws_rules = wb.create_sheet("Объединения")
 
     # Summary
-    style_title(ws_sum, "A1:H1", f"Продажи SamalCakes — отчет за 1–{days_fact:02d}.{month:02d}.{year}")
+    if days_fact == 1:
+        period_label = f"{days_fact:02d}.{month:02d}.{year}"
+    else:
+        period_label = f"01.{month:02d}.{year}–{days_fact:02d}.{month:02d}.{year}"
+
+    style_title(ws_sum, "A1:H1", f"Продажи SamalCakes — отчет за {period_label}")
     ws_sum.append([])
     ws_sum.append(["Показатель","Значение"])
     style_header(ws_sum[3])
     rows = [
         ("План месяца", month_plan),
-        (f"Факт 1–{days_fact:02d}.{month:02d}.{year}", total_fact),
+        (f"Факт за {period_label}", total_fact),
         ("Дней факта", days_fact),
         ("Выполнение", total_fact/month_plan if month_plan else 0),
-        ("Прогноз месяца", forecast_total),
-        ("Прогноз, %", forecast_total/month_plan if month_plan else 0),
-        ("Отклонение", forecast_total-month_plan),
+        ("Прогноз месяца", forecast_total if forecast_available else "Недостаточно данных (прогноз с 4-го дня)"),
+        ("Прогноз, %", forecast_total/month_plan if (forecast_available and month_plan) else None),
+        ("Отклонение", forecast_total-month_plan if forecast_available else None),
         ("Дней осталось", days_in_month-days_fact),
     ]
     for row in rows:
@@ -508,7 +517,14 @@ def build_report(input_path, output_path):
 
     for city, d in city_agg.items():
         p=d["plan"]; f=d["fact"]; fc=f/days_fact*days_in_month if days_fact else 0
-        vals=[city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0,city_store_counts.get(city,0)]
+        vals=[
+            city, p, f, f/p if p else 0,
+            fc if forecast_available else None,
+            fc/p if (forecast_available and p) else None,
+            fc-p if forecast_available else None,
+            f/total_fact if total_fact else 0,
+            city_store_counts.get(city,0)
+        ]
         for c,v in enumerate(vals,1):
             ws_sum.cell(rr,c,v)
         rr += 1
@@ -527,7 +543,13 @@ def build_report(input_path, output_path):
     rr=4
     for cat in CATEGORIES:
         p=cat_plan[cat]; f=cat_fact[cat]; fc=f/days_fact*days_in_month if days_fact else 0
-        vals=[cat,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0]
+        vals=[
+            cat, p, f, f/p if p else 0,
+            fc if forecast_available else None,
+            fc/p if (forecast_available and p) else None,
+            fc-p if forecast_available else None,
+            f/total_fact if total_fact else 0
+        ]
         for c,v in enumerate(vals,1):
             ws_cat.cell(rr,c,v)
         rr += 1
@@ -542,7 +564,12 @@ def build_report(input_path, output_path):
     rr=4
     for store,pdata in PLANS.items():
         city=store.split("/")[0]; p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
-        vals=[store,city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p]
+        vals=[
+            store, city, p, f, f/p if p else 0,
+            fc if forecast_available else None,
+            fc/p if (forecast_available and p) else None,
+            fc-p if forecast_available else None
+        ]
         for c,v in enumerate(vals,1):
             ws_store.cell(rr,c,v)
         rr += 1
@@ -558,7 +585,12 @@ def build_report(input_path, output_path):
     for n,(store,pdata) in enumerate(PLANS.items(),1):
         city=store.split("/")[0]; city_counts[city]+=1
         p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
-        vals=[n,city,store,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p]
+        vals=[
+            n, city, store, p, f, f/p if p else 0,
+            fc if forecast_available else None,
+            fc/p if (forecast_available and p) else None,
+            fc-p if forecast_available else None
+        ]
         for c,v in enumerate(vals,1):
             ws_all.cell(rr,c,v)
         rr += 1
@@ -579,7 +611,13 @@ def build_report(input_path, output_path):
     rr=7
     for store,pdata in PLANS.items():
         p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
-        vals=[store,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,1]
+        vals=[
+            store, p, f, f/p if p else 0,
+            fc if forecast_available else None,
+            fc/p if (forecast_available and p) else None,
+            fc-p if forecast_available else None,
+            1
+        ]
         for c,v in enumerate(vals,1):
             ws_detail.cell(rr,c,v)
             ws_detail.cell(rr,c).fill=PatternFill("solid",fgColor=STORE_FILL)
@@ -587,7 +625,13 @@ def build_report(input_path, output_path):
         rr += 1
         for cat in CATEGORIES:
             cp=pdata["categories"].get(cat,0); cf=fact_by_store[store].get(cat,0); cfc=cf/days_fact*days_in_month if days_fact else 0
-            vals=[cat,cp,cf,cf/cp if cp else 0,cfc,cfc/cp if cp else 0,cfc-cp,cf/f if f else 0]
+            vals=[
+                cat, cp, cf, cf/cp if cp else 0,
+                cfc if forecast_available else None,
+                cfc/cp if (forecast_available and cp) else None,
+                cfc-cp if forecast_available else None,
+                cf/f if f else 0
+            ]
             for c,v in enumerate(vals,1):
                 ws_detail.cell(rr,c,v)
             rr += 1
@@ -656,7 +700,7 @@ def build_report(input_path, output_path):
     for city, d in city_agg.items():
         p = d["plan"]
         f = d["fact"]
-        fc = f / days_fact * DAYS_IN_MONTH if days_fact else 0
+        fc = f / days_fact * days_in_month if days_fact else 0
         city_summary[city] = {
             "plan": p,
             "fact": f,
@@ -668,7 +712,7 @@ def build_report(input_path, output_path):
     for store, pdata in PLANS.items():
         p = pdata["plan"]
         f = store_facts[store]
-        fc = f / days_fact * DAYS_IN_MONTH if days_fact else 0
+        fc = f / days_fact * days_in_month if days_fact else 0
         store_summary[store] = {
             "plan": p,
             "fact": f,
@@ -681,7 +725,7 @@ def build_report(input_path, output_path):
     for cat in CATEGORIES:
         p = cat_plan[cat]
         f = cat_fact[cat]
-        fc = f / days_fact * DAYS_IN_MONTH if days_fact else 0
+        fc = f / days_fact * days_in_month if days_fact else 0
         category_summary[cat] = {
             "plan": p,
             "fact": f,
@@ -690,7 +734,7 @@ def build_report(input_path, output_path):
             "deviation": fc - p,
         }
 
-    return total_fact, month_plan, forecast_total, days_fact, city_summary, store_summary, category_summary
+    return total_fact, month_plan, forecast_total, days_fact, city_summary, store_summary, category_summary, forecast_available
 
 
 @app.get("/")
@@ -765,13 +809,13 @@ def process_document_in_background(chat_id, doc):
                 )
                 return
 
-            total_fact, plan, forecast, days, city_summary, store_summary, category_summary = build_report(inp, out)
+            total_fact, plan, forecast, days, city_summary, store_summary, category_summary, forecast_available = build_report(inp, out)
             pct = forecast / plan if plan else 0
 
             LAST_CITY_SUMMARY = city_summary
             LAST_STORE_SUMMARY = store_summary
             LAST_CATEGORY_SUMMARY = category_summary
-            LAST_REPORT_META = {"days": days}
+            LAST_REPORT_META = {"days": days, "forecast_available": forecast_available}
 
             city_facts_snapshot = {
                 city: d["fact"]
@@ -796,11 +840,18 @@ def process_document_in_background(chat_id, doc):
             else:
                 PREVIOUS_REPORT_SNAPSHOT = current_snapshot
 
-            caption = (
-                f"Готово ✅\n"
-                f"Факт за 1–{days}: {total_fact:,.0f} тг\n"
-                f"Прогноз: {forecast:,.0f} тг ({pct:.1%})"
-            ).replace(",", " ")
+            if forecast_available:
+                caption = (
+                    f"Готово ✅\n"
+                    f"Факт за 1–{days}: {total_fact:,.0f} тг\n"
+                    f"Прогноз: {forecast:,.0f} тг ({pct:.1%})"
+                ).replace(",", " ")
+            else:
+                caption = (
+                    f"Готово ✅\n"
+                    f"Факт за 1–{days}: {total_fact:,.0f} тг\n"
+                    f"Прогноз: пока не показываю — данных меньше 4 дней."
+                ).replace(",", " ")
 
             send_document(chat_id, out, caption=caption)
 
@@ -868,20 +919,36 @@ def telegram_webhook():
 
             for city, d in LAST_CITY_SUMMARY.items():
                 fact = d["fact"]
-                forecast = d["forecast"]
-                pct = d["forecast_pct"]
                 fact_s = f"{fact:,.0f}".replace(",", " ")
-                forecast_s = f"{forecast:,.0f}".replace(",", " ")
-                lines.append(
-                    f"{city}:\n"
-                    f"  Факт: {fact_s} тг\n"
-                    f"  Прогноз: {forecast_s} тг ({pct:.1%})"
-                )
+
+                if LAST_REPORT_META and not LAST_REPORT_META.get("forecast_available", True):
+                    lines.append(
+                        f"{city}:\n"
+                        f"  Факт: {fact_s} тг\n"
+                        f"  Прогноз: с 4-го дня месяца"
+                    )
+                else:
+                    forecast = d["forecast"]
+                    pct = d["forecast_pct"]
+                    forecast_s = f"{forecast:,.0f}".replace(",", " ")
+                    lines.append(
+                        f"{city}:\n"
+                        f"  Факт: {fact_s} тг\n"
+                        f"  Прогноз: {forecast_s} тг ({pct:.1%})"
+                    )
 
             send_message(chat_id, "\n".join(lines), keyboard=True)
             return "ok"
 
         if text == "🏆 Лучшие магазины":
+            if LAST_REPORT_META and not LAST_REPORT_META.get("forecast_available", True):
+                send_message(
+                    chat_id,
+                    "Прогноз появится с 4-го дня месяца. Сейчас показываю только фактические продажи — данных для надежного прогноза пока мало.",
+                    keyboard=True
+                )
+                return "ok"
+
             if not LAST_STORE_SUMMARY:
                 send_message(
                     chat_id,
@@ -906,6 +973,14 @@ def telegram_webhook():
             return "ok"
 
         if text == "⚠️ Отстающие магазины":
+            if LAST_REPORT_META and not LAST_REPORT_META.get("forecast_available", True):
+                send_message(
+                    chat_id,
+                    "Прогноз появится с 4-го дня месяца. Сейчас показываю только фактические продажи — данных для надежного прогноза пока мало.",
+                    keyboard=True
+                )
+                return "ok"
+
             if not LAST_STORE_SUMMARY:
                 send_message(
                     chat_id,
@@ -929,6 +1004,14 @@ def telegram_webhook():
             return "ok"
 
         if text == "📈 Лучшие категории":
+            if LAST_REPORT_META and not LAST_REPORT_META.get("forecast_available", True):
+                send_message(
+                    chat_id,
+                    "Прогноз появится с 4-го дня месяца. Сейчас показываю только фактические продажи — данных для надежного прогноза пока мало.",
+                    keyboard=True
+                )
+                return "ok"
+
             if not LAST_CATEGORY_SUMMARY:
                 send_message(
                     chat_id,
@@ -953,6 +1036,14 @@ def telegram_webhook():
             return "ok"
 
         if text == "📉 Отстающие категории":
+            if LAST_REPORT_META and not LAST_REPORT_META.get("forecast_available", True):
+                send_message(
+                    chat_id,
+                    "Прогноз появится с 4-го дня месяца. Сейчас показываю только фактические продажи — данных для надежного прогноза пока мало.",
+                    keyboard=True
+                )
+                return "ok"
+
             if not LAST_CATEGORY_SUMMARY:
                 send_message(
                     chat_id,
