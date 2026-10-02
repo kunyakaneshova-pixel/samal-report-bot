@@ -4,6 +4,7 @@ import json
 import tempfile
 import traceback
 import threading
+import calendar
 from datetime import datetime
 from collections import defaultdict
 
@@ -87,29 +88,35 @@ def parse_iiko(path):
     wb = load_workbook(path, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
 
-    period_text = str(ws["A3"].value or "")
-    re_mod = __import__("re")
+    period_text = str(ws["A3"].value or "").strip()
 
-    # Старый формат: "Период: с 01.09.2026 по 28.09.2026"
-    m = re_mod.search(r"по\s+(\d{2})\.(\d{2})\.(\d{4})", period_text)
+    # Поддерживаем все варианты iiko:
+    # 1) "Период: с 01.09.2026 по 28.09.2026"
+    # 2) "Дата: 01.10.2026-01.10.2026"
+    # 3) "Дата: 01.10.2026"
+    date_matches = __import__("re").findall(
+        r"(\d{1,2})\.(\d{1,2})\.(\d{4})",
+        period_text
+    )
 
-    if m:
-        day_end = int(m.group(1))
-        month = int(m.group(2))
-        year = int(m.group(3))
-    else:
-        # Новый формат: "Дата: 01.10.2026-01.10.2026"
-        m = re_mod.search(
-            r"(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})",
-            period_text
+    if not date_matches:
+        raise ValueError(
+            f"Не смогла определить дату периода в строке A3: {period_text}"
         )
-        if not m:
-            raise ValueError(
-                f"Не смогла определить конечную дату периода в строке A3: {period_text}"
-            )
-        day_end = int(m.group(4))
-        month = int(m.group(5))
-        year = int(m.group(6))
+
+    # Берём последнюю дату в строке как конечную дату периода.
+    day_s, month_s, year_s = date_matches[-1]
+    day_end = int(day_s)
+    month = int(month_s)
+    year = int(year_s)
+
+    # Проверка, что дата реальная.
+    try:
+        datetime(year, month, day_end)
+    except ValueError:
+        raise ValueError(
+            f"Некорректная дата в строке A3: {period_text}"
+        )
 
     blocks=[]
     enterprise=None
@@ -442,8 +449,12 @@ def money(x):
 
 def build_report(input_path, output_path):
     fact_by_store, store_facts, total_fact, days_fact, month, year = analyze(input_path)
+
+    # Реальное количество дней в месяце.
+    days_in_month = calendar.monthrange(year, month)[1]
+
     month_plan = sum(v["plan"] for v in PLANS.values())
-    forecast_total = total_fact / days_fact * DAYS_IN_MONTH if days_fact else 0
+    forecast_total = total_fact / days_fact * days_in_month if days_fact else 0
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -462,13 +473,13 @@ def build_report(input_path, output_path):
     style_header(ws_sum[3])
     rows = [
         ("План месяца", month_plan),
-        (f"Факт 1–{days_fact} сентября", total_fact),
+        (f"Факт 1–{days_fact:02d}.{month:02d}.{year}", total_fact),
         ("Дней факта", days_fact),
         ("Выполнение", total_fact/month_plan if month_plan else 0),
         ("Прогноз месяца", forecast_total),
         ("Прогноз, %", forecast_total/month_plan if month_plan else 0),
         ("Отклонение", forecast_total-month_plan),
-        ("Дней осталось", DAYS_IN_MONTH-days_fact),
+        ("Дней осталось", days_in_month-days_fact),
     ]
     for row in rows:
         ws_sum.append(row)
@@ -484,16 +495,20 @@ def build_report(input_path, output_path):
         city_agg[city]["plan"] += PLANS[store]["plan"]
         city_agg[city]["fact"] += store_facts[store]
 
-    style_title(ws_sum, "A14:H14", "Сводка по городам")
-    headers=["Город","План, тг","Факт, тг","Выполнение","Прогноз, тг","Прогноз, %","Отклонение, тг","Доля факта"]
+    style_title(ws_sum, "A14:I14", "Сводка по городам")
+    headers=["Город","План, тг","Факт, тг","Выполнение","Прогноз, тг","Прогноз, %","Отклонение, тг","Доля факта","Количество магазинов"]
     for col, h in enumerate(headers,1):
         ws_sum.cell(15,col,h)
     style_header(ws_sum[15])
 
     rr=16
+    city_store_counts = defaultdict(int)
+    for store in PLANS:
+        city_store_counts[store.split("/")[0]] += 1
+
     for city, d in city_agg.items():
-        p=d["plan"]; f=d["fact"]; fc=f/days_fact*DAYS_IN_MONTH if days_fact else 0
-        vals=[city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0]
+        p=d["plan"]; f=d["fact"]; fc=f/days_fact*days_in_month if days_fact else 0
+        vals=[city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0,city_store_counts.get(city,0)]
         for c,v in enumerate(vals,1):
             ws_sum.cell(rr,c,v)
         rr += 1
@@ -511,7 +526,7 @@ def build_report(input_path, output_path):
 
     rr=4
     for cat in CATEGORIES:
-        p=cat_plan[cat]; f=cat_fact[cat]; fc=f/days_fact*DAYS_IN_MONTH if days_fact else 0
+        p=cat_plan[cat]; f=cat_fact[cat]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[cat,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,f/total_fact if total_fact else 0]
         for c,v in enumerate(vals,1):
             ws_cat.cell(rr,c,v)
@@ -526,7 +541,7 @@ def build_report(input_path, output_path):
 
     rr=4
     for store,pdata in PLANS.items():
-        city=store.split("/")[0]; p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*DAYS_IN_MONTH if days_fact else 0
+        city=store.split("/")[0]; p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[store,city,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p]
         for c,v in enumerate(vals,1):
             ws_store.cell(rr,c,v)
@@ -542,7 +557,7 @@ def build_report(input_path, output_path):
     city_counts=defaultdict(int)
     for n,(store,pdata) in enumerate(PLANS.items(),1):
         city=store.split("/")[0]; city_counts[city]+=1
-        p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*DAYS_IN_MONTH if days_fact else 0
+        p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[n,city,store,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p]
         for c,v in enumerate(vals,1):
             ws_all.cell(rr,c,v)
@@ -556,14 +571,14 @@ def build_report(input_path, output_path):
     style_title(ws_detail, "A1:H1", "По каждому магазину — план, факт и категории")
     ws_detail["A2"]="Период факта"; ws_detail["B2"]=f"01.{month:02d}.{year}–{days_fact:02d}.{month:02d}.{year}"
     ws_detail["A3"]="Дней факта"; ws_detail["B3"]=days_fact
-    ws_detail["A4"]="Дней в месяце"; ws_detail["B4"]=DAYS_IN_MONTH
+    ws_detail["A4"]="Дней в месяце"; ws_detail["B4"]=days_in_month
     detail_headers=["Магазин / категория","План","Факт","Выполнение","Прогноз","Прогноз, %","Отставание","Доля в магазине, %"]
     for c,h in enumerate(detail_headers,1):
         ws_detail.cell(6,c,h)
     style_header(ws_detail[6])
     rr=7
     for store,pdata in PLANS.items():
-        p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*DAYS_IN_MONTH if days_fact else 0
+        p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[store,p,f,f/p if p else 0,fc,fc/p if p else 0,fc-p,1]
         for c,v in enumerate(vals,1):
             ws_detail.cell(rr,c,v)
@@ -571,7 +586,7 @@ def build_report(input_path, output_path):
             ws_detail.cell(rr,c).font=Font(bold=True)
         rr += 1
         for cat in CATEGORIES:
-            cp=pdata["categories"].get(cat,0); cf=fact_by_store[store].get(cat,0); cfc=cf/days_fact*DAYS_IN_MONTH if days_fact else 0
+            cp=pdata["categories"].get(cat,0); cf=fact_by_store[store].get(cat,0); cfc=cf/days_fact*days_in_month if days_fact else 0
             vals=[cat,cp,cf,cf/cp if cp else 0,cfc,cfc/cp if cp else 0,cfc-cp,cf/f if f else 0]
             for c,v in enumerate(vals,1):
                 ws_detail.cell(rr,c,v)
