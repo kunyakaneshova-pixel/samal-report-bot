@@ -430,8 +430,11 @@ def analyze(path):
 
 
 def build_city_split_report(input_path, output_path):
-    """Создаёт отдельные листы по городам из последней выгрузки iiko."""
+    """Создаёт отдельные листы по городам: план, факт, выполнение, прогноз и отклонение."""
     fact_by_store, store_facts, total_fact, days_fact, month, year = analyze(input_path)
+    days_in_month = calendar.monthrange(year, month)[1]
+    forecast_available = days_fact >= 4
+
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -441,48 +444,92 @@ def build_city_split_report(input_path, output_path):
         cities[city].append(store)
 
     for city, stores in cities.items():
-        safe_title = city[:31]
-        ws = wb.create_sheet(safe_title)
-        style_title(ws, "A1:D1", f"{city} — продажи 1–{days_fact:02d}.{month:02d}.{year}")
-        ws.append([])
-        ws.append(["Магазин", "Категория", "Факт, тг", "Доля в магазине"])
-        style_header(ws[3])
+        ws = wb.create_sheet(city[:31])
+        style_title(ws, "A1:H1", f"{city} — план и продажи 1–{days_fact:02d}.{month:02d}.{year}")
 
-        row = 4
-        city_total = 0.0
+        city_plan = sum(PLANS[s]["plan"] for s in stores)
+        city_fact = sum(store_facts.get(s, 0.0) for s in stores)
+        city_forecast = city_fact / days_fact * days_in_month if days_fact else 0
+
+        ws.append([])
+        ws.append(["Город", "План, тг", "Факт, тг", "Выполнение", "Прогноз, тг", "Прогноз, %", "Отклонение, тг", "Дней факта"])
+        style_header(ws[3])
+        ws.append([
+            city,
+            city_plan,
+            city_fact,
+            city_fact / city_plan if city_plan else 0,
+            city_forecast if forecast_available else None,
+            city_forecast / city_plan if (forecast_available and city_plan) else None,
+            city_forecast - city_plan if forecast_available else None,
+            days_fact,
+        ])
+        for c in [2, 3, 5, 7]:
+            ws.cell(4, c).number_format = '#,##0'
+        for c in [4, 6]:
+            ws.cell(4, c).number_format = '0.0%'
+        for c in range(1, 9):
+            ws.cell(4, c).fill = PatternFill("solid", fgColor=STORE_FILL)
+            ws.cell(4, c).font = Font(bold=True)
+
+        ws.append([])
+        ws.append(["Магазин / категория", "План, тг", "Факт, тг", "Выполнение", "Прогноз, тг", "Прогноз, %", "Отклонение, тг", "Доля в магазине"])
+        style_header(ws[6])
+
+        row = 7
         for store in stores:
+            store_plan = PLANS[store]["plan"]
             store_fact = store_facts.get(store, 0.0)
-            city_total += store_fact
-            ws.cell(row, 1, store)
-            ws.cell(row, 3, store_fact)
-            ws.cell(row, 3).number_format = '#,##0'
-            for c in range(1, 5):
+            store_forecast = store_fact / days_fact * days_in_month if days_fact else 0
+            vals = [
+                store,
+                store_plan,
+                store_fact,
+                store_fact / store_plan if store_plan else 0,
+                store_forecast if forecast_available else None,
+                store_forecast / store_plan if (forecast_available and store_plan) else None,
+                store_forecast - store_plan if forecast_available else None,
+                1 if store_fact else 0,
+            ]
+            for c, v in enumerate(vals, 1):
+                ws.cell(row, c, v)
                 ws.cell(row, c).fill = PatternFill("solid", fgColor=STORE_FILL)
                 ws.cell(row, c).font = Font(bold=True)
+            for c in [2, 3, 5, 7]:
+                ws.cell(row, c).number_format = '#,##0'
+            for c in [4, 6, 8]:
+                ws.cell(row, c).number_format = '0.0%'
             row += 1
 
             for cat in CATEGORIES:
-                amount = fact_by_store.get(store, {}).get(cat, 0.0)
-                if not amount:
+                cat_plan = PLANS[store]["categories"].get(cat, 0)
+                cat_fact = fact_by_store.get(store, {}).get(cat, 0.0)
+                if not cat_plan and not cat_fact:
                     continue
-                ws.cell(row, 2, cat)
-                ws.cell(row, 3, amount)
-                ws.cell(row, 4, amount / store_fact if store_fact else 0)
-                ws.cell(row, 3).number_format = '#,##0'
-                ws.cell(row, 4).number_format = '0.0%'
+                cat_forecast = cat_fact / days_fact * days_in_month if days_fact else 0
+                vals = [
+                    cat,
+                    cat_plan,
+                    cat_fact,
+                    cat_fact / cat_plan if cat_plan else 0,
+                    cat_forecast if forecast_available else None,
+                    cat_forecast / cat_plan if (forecast_available and cat_plan) else None,
+                    cat_forecast - cat_plan if forecast_available else None,
+                    cat_fact / store_fact if store_fact else 0,
+                ]
+                for c, v in enumerate(vals, 1):
+                    ws.cell(row, c, v)
+                for c in [2, 3, 5, 7]:
+                    ws.cell(row, c).number_format = '#,##0'
+                for c in [4, 6, 8]:
+                    ws.cell(row, c).number_format = '0.0%'
                 row += 1
             row += 1
 
-        ws.cell(row, 1, f"ИТОГО {city}")
-        ws.cell(row, 3, city_total)
-        ws.cell(row, 1).font = Font(bold=True)
-        ws.cell(row, 3).font = Font(bold=True)
-        ws.cell(row, 3).number_format = '#,##0'
-        ws.freeze_panes = "A4"
-        ws.column_dimensions["A"].width = 34
-        ws.column_dimensions["B"].width = 34
-        ws.column_dimensions["C"].width = 18
-        ws.column_dimensions["D"].width = 20
+        ws.freeze_panes = "A7"
+        widths = {"A": 36, "B": 16, "C": 16, "D": 14, "E": 18, "F": 14, "G": 18, "H": 18}
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
 
     wb.save(output_path)
     return list(cities.keys())
