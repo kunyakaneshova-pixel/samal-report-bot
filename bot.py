@@ -39,6 +39,7 @@ LAST_REPORT_META = None
 LAST_REPORT_SNAPSHOT = None
 PREVIOUS_REPORT_SNAPSHOT = None
 PROCESSING_FILE_IDS = set()
+LAST_REPORT_FILE_CONTENT = None
 
 TITLE_FILL = "1F4E78"
 HEADER_FILL = "D9EAF7"
@@ -62,6 +63,7 @@ MAIN_KEYBOARD = {
         [{"text": "🚀 Рост за день"}, {"text": "🏙 Рост по городам"}],
         [{"text": "🔥 Топ продукции"}, {"text": "🐢 Слабые позиции"}],
         [{"text": "🏙 Топ продукции по городам"}],
+        [{"text": "📂 Разделить по городам"}],
         [{"text": "🧾 Средний чек"}, {"text": "↔️ Сравнить со вчера"}],
         [{"text": "📋 Правила объединения"}, {"text": "🎯 Планы"}],
         [{"text": "ℹ️ Помощь"}]
@@ -427,6 +429,65 @@ def analyze(path):
     return fact_by_store, store_facts, total_fact, day_end, month, year
 
 
+def build_city_split_report(input_path, output_path):
+    """Создаёт отдельные листы по городам из последней выгрузки iiko."""
+    fact_by_store, store_facts, total_fact, days_fact, month, year = analyze(input_path)
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    cities = defaultdict(list)
+    for store in PLANS:
+        city = store.split("/")[0]
+        cities[city].append(store)
+
+    for city, stores in cities.items():
+        safe_title = city[:31]
+        ws = wb.create_sheet(safe_title)
+        style_title(ws, "A1:D1", f"{city} — продажи 1–{days_fact:02d}.{month:02d}.{year}")
+        ws.append([])
+        ws.append(["Магазин", "Категория", "Факт, тг", "Доля в магазине"])
+        style_header(ws[3])
+
+        row = 4
+        city_total = 0.0
+        for store in stores:
+            store_fact = store_facts.get(store, 0.0)
+            city_total += store_fact
+            ws.cell(row, 1, store)
+            ws.cell(row, 3, store_fact)
+            ws.cell(row, 3).number_format = '#,##0'
+            for c in range(1, 5):
+                ws.cell(row, c).fill = PatternFill("solid", fgColor=STORE_FILL)
+                ws.cell(row, c).font = Font(bold=True)
+            row += 1
+
+            for cat in CATEGORIES:
+                amount = fact_by_store.get(store, {}).get(cat, 0.0)
+                if not amount:
+                    continue
+                ws.cell(row, 2, cat)
+                ws.cell(row, 3, amount)
+                ws.cell(row, 4, amount / store_fact if store_fact else 0)
+                ws.cell(row, 3).number_format = '#,##0'
+                ws.cell(row, 4).number_format = '0.0%'
+                row += 1
+            row += 1
+
+        ws.cell(row, 1, f"ИТОГО {city}")
+        ws.cell(row, 3, city_total)
+        ws.cell(row, 1).font = Font(bold=True)
+        ws.cell(row, 3).font = Font(bold=True)
+        ws.cell(row, 3).number_format = '#,##0'
+        ws.freeze_panes = "A4"
+        ws.column_dimensions["A"].width = 34
+        ws.column_dimensions["B"].width = 34
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 20
+
+    wb.save(output_path)
+    return list(cities.keys())
+
+
 def style_title(ws, cell_range, text):
     ws.merge_cells(cell_range)
     c = ws[cell_range.split(":")[0]]
@@ -757,7 +818,7 @@ def setup_webhook():
 def process_document_in_background(chat_id, doc):
     global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY
     global LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY
-    global LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT
+    global LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT, LAST_REPORT_FILE_CONTENT
 
     file_id = doc.get("file_id")
 
@@ -767,6 +828,7 @@ def process_document_in_background(chat_id, doc):
         response = requests.get(f"{TELEGRAM_FILE_API}/{file_path}", timeout=60)
         response.raise_for_status()
         content = response.content
+        LAST_REPORT_FILE_CONTENT = content
 
         with tempfile.TemporaryDirectory() as td:
             inp = os.path.join(td, "iiko.xlsx")
@@ -873,7 +935,7 @@ def process_document_in_background(chat_id, doc):
 
 @app.post("/telegram")
 def telegram_webhook():
-    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT, PROCESSING_FILE_IDS
+    global LAST_CITY_SUMMARY, LAST_STORE_SUMMARY, LAST_CATEGORY_SUMMARY, LAST_PRODUCT_SUMMARY, LAST_PRODUCT_CITY_SUMMARY, LAST_AVG_CHECK_SUMMARY, LAST_REPORT_META, LAST_REPORT_SNAPSHOT, PREVIOUS_REPORT_SNAPSHOT, PROCESSING_FILE_IDS, LAST_REPORT_FILE_CONTENT
     update = request.get_json(silent=True) or {}
     try:
         msg = update.get("message") or {}
@@ -938,6 +1000,32 @@ def telegram_webhook():
                     )
 
             send_message(chat_id, "\n".join(lines), keyboard=True)
+            return "ok"
+
+
+        if text == "📂 Разделить по городам":
+            if not LAST_REPORT_FILE_CONTENT:
+                send_message(
+                    chat_id,
+                    "Сначала отправь свежий Excel-файл из iiko, затем нажми «📂 Разделить по городам».",
+                    keyboard=True
+                )
+                return "ok"
+
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    inp = os.path.join(td, "iiko.xlsx")
+                    out = os.path.join(td, "Продажи_по_городам.xlsx")
+                    with open(inp, "wb") as f:
+                        f.write(LAST_REPORT_FILE_CONTENT)
+                    cities = build_city_split_report(inp, out)
+                    send_document(
+                        chat_id,
+                        out,
+                        caption="Готово ✅ Разделила отчет по городам: " + ", ".join(cities)
+                    )
+            except Exception as e:
+                send_message(chat_id, "Не получилось разделить файл по городам.\n\n" + str(e)[:2000], keyboard=True)
             return "ok"
 
         if text == "🏆 Лучшие магазины":
