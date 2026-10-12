@@ -409,20 +409,26 @@ def analyze(path):
         key = f"{enterprise}|||{subgroup}"
         store = STORE_MAPPING.get(key)
         if not store:
+            # Новая точка: учитываем выручку без выдуманного плана.
+            city = _city_from_enterprise(enterprise)
+            store = f"{city}/{enterprise}"
             unknown_stores.append(f"{enterprise} / {subgroup}")
-            continue
+        if store not in PLANS:
+            PLANS[store] = {"plan": 0, "categories": {c: 0 for c in CATEGORIES}}
+        if store not in fact_by_store:
+            fact_by_store[store] = {c: 0.0 for c in CATEGORIES}
 
         for raw_group, amount in items:
             cat = GROUP_MAPPING.get(raw_group)
-            if not cat:
+            if not cat or cat not in CATEGORIES:
                 unknown_groups.append(raw_group)
-                continue
+                cat = "Общая номенклатура"
             fact_by_store[store][cat] += amount
 
     if unknown_stores:
-        raise ValueError("Неизвестные магазины в новой выгрузке:\n" + "\n".join(sorted(set(unknown_stores))))
+        print("Новые магазины без плана:", sorted(set(unknown_stores)), flush=True)
     if unknown_groups:
-        raise ValueError("Новые группы товаров, которых нет в правилах:\n" + "\n".join(sorted(set(unknown_groups))))
+        print("Новые группы (общая номенклатура):", sorted(set(unknown_groups)), flush=True)
 
     store_facts = {s: sum(v.values()) for s,v in fact_by_store.items()}
     total_fact = sum(store_facts.values())
@@ -1237,7 +1243,7 @@ def telegram_webhook():
             total_add_s = f"{total_add:,.0f}".replace(",", " ")
 
             lines = [
-                f"🚀 Рост за день: {prev['days']} → {cur['days']} сентября",
+                f"🚀 Рост за день: {prev['days']} → {cur['days']} числа",
                 "",
                 f"Продажи за день: {total_add_s} тг",
                 "",
@@ -1297,7 +1303,7 @@ def telegram_webhook():
             total_add = cur["total_fact"] - prev["total_fact"]
 
             lines = [
-                f"🏙 Рост по городам: {prev['days']} → {cur['days']} сентября",
+                f"🏙 Рост по городам: {prev['days']} → {cur['days']} числа",
                 ""
             ]
             for i, (city, delta) in enumerate(city_changes, 1):
@@ -1495,7 +1501,7 @@ def telegram_webhook():
                 "• Заказные торты → Заказные десерты Samal Premium\n"
                 "• Булочки + Самса + Хлебобулочные → Хлебобулочные изделия\n"
                 "• Шоколад → Десерты\n"
-                "• Горячие напитки + Напитки Актобе + Упаковка + Доставка + Хоз товары + Инвентарь/посуда → Общая номенклатура"
+                "• Горячие напитки + Напитки Актобе + Упаковка + Доставка + Хоз товары + Оформление → Общая номенклатура"
             )
             send_message(chat_id, rules, keyboard=True)
             return "ok"
