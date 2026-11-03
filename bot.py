@@ -1525,6 +1525,11 @@ LAST_REPORT_META = None
 LAST_REPORT_SNAPSHOT = None
 PREVIOUS_REPORT_SNAPSHOT = None
 PROCESSING_FILE_IDS = set()
+# Последняя успешно обработанная выгрузка для каждого чата.
+# Храним Telegram file_id, а не содержимое файла, чтобы не расходовать память Render.
+LAST_SOURCE_FILES = {}
+SPLIT_PENDING_CHATS = set()
+SPLIT_IN_PROGRESS = set()
 
 TITLE_FILL = "1F4E78"
 HEADER_FILL = "D9EAF7"
@@ -1543,6 +1548,7 @@ def tg(method, **kwargs):
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "📊 Сделать отчет"}, {"text": "🏙 Сводка по городам"}],
+        [{"text": "📂 Разделить по городам"}],
         [{"text": "🏆 Лучшие магазины"}, {"text": "⚠️ Отстающие магазины"}],
         [{"text": "📈 Лучшие категории"}, {"text": "📉 Отстающие категории"}],
         [{"text": "🚀 Рост за день"}, {"text": "🏙 Рост по городам"}],
@@ -1973,9 +1979,39 @@ def money(x):
     return float(x or 0)
 
 
-def build_report(input_path, output_path):
+def build_report(input_path, output_path, city_filter=None):
     (fact_by_store, store_facts, total_fact, days_fact, month, year,
      active_plans, active_categories, audit) = analyze(input_path)
+
+    if city_filter is not None:
+        # Сохраняем только магазины выбранного города, включая новые точки без плана.
+        active_plans = {
+            store: data for store, data in active_plans.items()
+            if store.split("/", 1)[0] == city_filter
+        }
+        fact_by_store = {store: fact_by_store[store] for store in active_plans}
+        store_facts = {store: store_facts[store] for store in active_plans}
+        total_fact = sum(store_facts.values())
+        new_stores = {
+            store: raw for store, raw in audit["new_stores"].items()
+            if store in active_plans
+        }
+        new_groups = {
+            cat: raw for cat, raw in audit["new_groups"].items()
+            if any(cat in values for values in fact_by_store.values())
+        }
+        excluded_apk = audit["excluded_apk_revenue"] if city_filter == "Ақтөбе" else 0.0
+        audit = {
+            "source_total": total_fact + excluded_apk,
+            "excluded_apk_revenue": excluded_apk,
+            "new_stores": new_stores,
+            "new_groups": new_groups,
+            "new_store_revenue": sum(store_facts[store] for store in new_stores),
+            "new_group_revenue": sum(
+                values.get(cat, 0.0) for values in fact_by_store.values()
+                for cat in new_groups
+            ),
+        }
 
     # Реальное количество дней в месяце.
     days_in_month = calendar.monthrange(year, month)[1]
@@ -2004,7 +2040,8 @@ def build_report(input_path, output_path):
     else:
         period_label = f"01.{month:02d}.{year}–{days_fact:02d}.{month:02d}.{year}"
 
-    style_title(ws_sum, "A1:H1", f"Продажи SamalCakes — отчет за {period_label}")
+    report_scope = f"{city_filter} — " if city_filter else ""
+    style_title(ws_sum, "A1:H1", f"Продажи SamalCakes — {report_scope}отчет за {period_label}")
     ws_sum.append([])
     ws_sum.append(["Показатель","Значение"])
     style_header(ws_sum[3])
@@ -2020,8 +2057,12 @@ def build_report(input_path, output_path):
     ]
     for row in rows:
         ws_sum.append(row)
-    ws_sum["J2"] = "Ноябрь 2026: использована проверенная сумма планов магазинов Актобе 539,5 млн тг."
-    ws_sum["J3"] = "Uralsk-20: 3 млн тг, категории приблизительно по структуре Уральска; Ақтөбе/АПК исключен."
+    if city_filter:
+        ws_sum["J2"] = f"Отдельный отчет: {city_filter}. Только магазины этого города."
+        ws_sum["J3"] = "АПК исключён из показателей Актобе; при наличии выручки показан в контроле."
+    else:
+        ws_sum["J2"] = "Ноябрь 2026: использована проверенная сумма планов магазинов Актобе 539,5 млн тг."
+        ws_sum["J3"] = "Uralsk-20: 3 млн тг, категории приблизительно по структуре Уральска; Ақтөбе/АПК исключен."
     for r in [4,5,8,10]:
         ws_sum[f"B{r}"].number_format = '#,##0'
     for r in [7,9]:
@@ -2297,6 +2338,63 @@ def build_report(input_path, output_path):
             store_summary, category_summary, forecast_available, audit)
 
 
+def send_city_reports(chat_id, input_path):
+    """Разделить одну выгрузку iiko на отдельные Excel-файлы по городам."""
+    import os
+    import tempfile
+
+    (_, _, grand_total, _, month, year, active_plans, _, _) = analyze(input_path)
+    preferred = ["Ақтөбе", "Уральск", "Астана", "Кызылорда", "Костанай"]
+    actual_cities = {store.split("/", 1)[0] for store in active_plans}
+    cities = [city for city in preferred if city in actual_cities]
+    cities += sorted(actual_cities - set(cities))
+
+    totals = []
+    with tempfile.TemporaryDirectory() as tempdir:
+        # Формируем все файлы и проверяем суммы ДО отправки, чтобы не отдать
+        # пользователю неполный набор при ошибке в одном городе.
+        paths = []
+        for city in cities:
+            safe_city = city.replace("/", "_").replace("\\", "_")
+            out = os.path.join(tempdir, f"Продажи_{safe_city}_{month:02d}_{year}.xlsx")
+            fact, plan, _, _, _, _, _, _, _ = build_report(
+                input_path, out, city_filter=city
+            )
+            totals.append((city, fact, plan))
+            paths.append((city, out))
+
+        if abs(sum(fact for _, fact, _ in totals) - grand_total) > 0.01:
+            raise ValueError("Контроль разделения не пройден: сумма городов не равна общему факту")
+
+        for city, path in paths:
+            send_document(chat_id, path, caption=f"🏙 {city} — отдельный отчет за {month:02d}.{year}")
+
+    lines = ["✅ Разделила по городам. Все Excel-файлы отправлены.", ""]
+    for city, fact, plan in totals:
+        lines.append(f"{city}: факт {fact:,.0f} тг; план {plan:,.0f} тг".replace(",", " "))
+    lines.append("")
+    lines.append("Контроль: сумма факта по городам совпадает с общим отчетом.")
+    send_message(chat_id, "\n".join(lines), keyboard=True)
+
+
+def split_last_report_in_background(chat_id, file_id):
+    """Разделить последнюю выгрузку по кнопке без повторной отправки файла."""
+    try:
+        f_info = tg("getFile", json={"file_id": file_id})
+        response = requests.get(f"{TELEGRAM_FILE_API}/{f_info['file_path']}", timeout=90)
+        response.raise_for_status()
+        with tempfile.TemporaryDirectory() as td:
+            inp = os.path.join(td, "iiko.xlsx")
+            with open(inp, "wb") as f:
+                f.write(response.content)
+            send_city_reports(chat_id, inp)
+    except Exception as exc:
+        traceback.print_exc()
+        send_message(chat_id, "Не удалось разделить отчет: " + str(exc)[:1000], keyboard=True)
+    finally:
+        SPLIT_IN_PROGRESS.discard(chat_id)
+
+
 @app.get("/")
 def home():
     return "Samal Report Bot работает ✅"
@@ -2421,6 +2519,14 @@ def process_document_in_background(chat_id, doc):
                     " Все продажи учтены; подробности во вкладке «Контроль данных»."
                 )
             send_document(chat_id, out, caption=caption)
+            LAST_SOURCE_FILES[chat_id] = file_id
+
+            # Если пользователь выбрал разделение до загрузки, отправляем
+            # пять отдельных отчетов автоматически сразу после общего.
+            if chat_id in SPLIT_PENDING_CHATS:
+                SPLIT_PENDING_CHATS.discard(chat_id)
+                send_message(chat_id, "📂 Разделяю выгрузку по городам…", keyboard=True)
+                send_city_reports(chat_id, inp)
 
     except Exception as e:
         traceback.print_exc()
@@ -2468,6 +2574,28 @@ def telegram_webhook():
                 "Я автоматически сделаю полный отчет: сводка, города, все магазины, категории и прогноз.",
                 keyboard=True
             )
+            return "ok"
+
+        if text == "📂 Разделить по городам":
+            file_id = LAST_SOURCE_FILES.get(chat_id)
+            if file_id:
+                if chat_id in SPLIT_IN_PROGRESS:
+                    send_message(chat_id, "Уже разделяю отчет. Подожди немного.", keyboard=True)
+                    return "ok"
+                SPLIT_IN_PROGRESS.add(chat_id)
+                send_message(chat_id, "📂 Готовлю отдельные Excel-файлы по городам…", keyboard=True)
+                threading.Thread(
+                    target=split_last_report_in_background,
+                    args=(chat_id, file_id),
+                    daemon=True,
+                ).start()
+            else:
+                SPLIT_PENDING_CHATS.add(chat_id)
+                send_message(
+                    chat_id,
+                    "Пришли выгрузку .xlsx из iiko. Я сразу сделаю общий отчет и отдельные файлы по каждому городу.",
+                    keyboard=True,
+                )
             return "ok"
 
         if text == "🏙 Сводка по городам":
@@ -2959,7 +3087,8 @@ def telegram_webhook():
                 "2. Отправь свежий файл .xlsx из iiko.\n"
                 "3. Подожди немного.\n"
                 "4. Я верну готовый Excel-отчет.\n"
-                "5. Потом можешь смотреть города, магазины, категории и сравнение со вчера прямо в Telegram.\n\n"
+                "5. Нажми «📂 Разделить по городам», чтобы получить пять отдельных Excel-файлов.\n"
+                "6. Потом можешь смотреть города, магазины, категории и сравнение со вчера прямо в Telegram.\n\n"
                 "Можно и без кнопки — просто отправить файл.",
                 keyboard=True
             )
