@@ -1323,6 +1323,30 @@ NOVEMBER_OLD_TO_NEW = {
 
 CATEGORIES = CONFIG["categories"]
 PLANS = NOVEMBER_PLANS
+
+# Изменения плана ноября 2026 по подтверждению пользователя.
+# АПК исключен полностью. Его выручку показываем только в контрольном листе.
+EXCLUDED_AKTOBE_APK = "Ақтөбе/АПК"
+PLANS.pop(EXCLUDED_AKTOBE_APK, None)
+
+# План Uralsk-20 — 3 000 000 тг. Категории оценены по взвешенным
+# долям всех остальных 20 магазинов Уральска (итог строго 3 млн).
+URALSK20_STORE = "Уральск/ТРК АБХ 179/11"
+PLANS[URALSK20_STORE] = {
+    "plan": 3_000_000,
+    "categories": {
+        "Торты": 1_998_296,
+        "Пироги": 263_293,
+        "Чизкейки": 282_261,
+        "Чайные наборы, пирожное": 271_081,
+        "Десерты": 144_137,
+        "Заказные десерты Samal Premium": 0,
+        "Хлебобулочные изделия": 2_236,
+        "Общая номенклатура": 9_609,
+        "Свечи": 29_087,
+    },
+}
+
 STORE_MAPPING = {
     raw_key: NOVEMBER_OLD_TO_NEW.get(old_name, old_name)
     for raw_key, old_name in CONFIG["store_mapping"].items()
@@ -1330,6 +1354,9 @@ STORE_MAPPING = {
 }
 # Подтвержденное соответствие из октябрьской выгрузки iiko.
 STORE_MAPPING['Q-Qyzylorda-406 "КоркытАта 51"|||Q-Qyzylorda-406 "Коркыт ата 51"'] = 'Кызылорда/КоркытАта 51'
+# Явно фиксируем Uralsk-20 по ID iiko: любое написание ТРК АБХ
+# с тем же ID попадает в один магазин, без запроса подтверждения.
+STORE_MAPPING['Uralsk-20 "ТРК АБХ 179\\11"|||Uralsk-20 "ТРК Абх 179"'] = URALSK20_STORE
 GROUP_MAPPING = dict(CONFIG["group_mapping"])
 GROUP_MAPPING.update({
     "Оформление": "Общая номенклатура",
@@ -1356,8 +1383,7 @@ def find_new_november_store(enterprise, subgroup):
         return 'Ақтөбе/Остановка Ару'
     if re.search(r'aktobe[-_ ]*54\b', s) or 'летный' in s or 'летный' in s.replace('ё','е'):
         return 'Ақтөбе/Остановка ЛЕТНЫЙ'
-    if ('aktobe' in s or 'актобе' in s) and re.search(r'\bапк\b',s):
-        return 'Ақтөбе/АПК'
+    # Актобе/АПК исключен из ноябрьских отчетов (см. is_excluded_aktobe_apk).
     if ('qyzylorda' in s or 'kyzylorda' in s or 'кызылорда' in s):
         if re.search(r'\b406\b',s) or ('коркыт' in s and re.search(r'\b51\b',s)):
             return 'Кызылорда/КоркытАта 51'
@@ -1377,6 +1403,15 @@ CITY_PREFIXES = {
     "qyzylorda": "Кызылорда", "kyzylorda": "Кызылорда", "кызылорда": "Кызылорда",
     "kostanai": "Костанай", "kostanay": "Костанай", "костанай": "Костанай",
 }
+
+
+def is_excluded_aktobe_apk(enterprise, subgroup=None):
+    """Исключить только АПК Актобе, не задевая остальные предприятия."""
+    s = unicodedata.normalize("NFKC", f"{enterprise or ''} {subgroup or ''}").casefold()
+    s = s.replace("ё", "е").replace("ә", "а").replace("ө", "о")
+    has_aktobe = bool(re.search(r"(?:aktobe|актобе|ақтөбе)", s))
+    has_apk = bool(re.search(r"(?<![a-zа-я])(?:апк|apk)(?![a-zа-я])", s))
+    return has_aktobe and has_apk
 
 
 def normalize_iiko_name(value):
@@ -1671,6 +1706,8 @@ def parse_product_report(path):
         enterprise = ws.cell(r, enterprise_col).value
         if enterprise:
             current_enterprise = str(enterprise).strip()
+        if is_excluded_aktobe_apk(current_enterprise):
+            continue
 
         dish = ws.cell(r, dish_col).value
         qty = ws.cell(r, qty_col).value
@@ -1783,6 +1820,8 @@ def parse_average_check_report(path):
                 continue
 
             enterprise = str(enterprise).strip()
+            if is_excluded_aktobe_apk(enterprise):
+                continue
             if enterprise.lower() in ("итого", "всего") or enterprise.lower().endswith(" всего"):
                 continue
 
@@ -1814,6 +1853,8 @@ def parse_average_check_report(path):
             continue
 
         enterprise = str(enterprise).strip()
+        if is_excluded_aktobe_apk(enterprise):
+            continue
 
         if not enterprise.lower().endswith(" всего"):
             continue
@@ -1864,8 +1905,13 @@ def analyze(path):
     dynamic_by_id, dynamic_by_name = {}, {}
     new_stores, new_groups = {}, {}
     source_total = 0.0
+    excluded_apk_revenue = 0.0
 
     for enterprise, subgroup, items in blocks:
+        if is_excluded_aktobe_apk(enterprise, subgroup):
+            excluded_apk_revenue += sum(amount for _, amount in items)
+            source_total += sum(amount for _, amount in items)
+            continue
         store, is_new = resolve_store(
             enterprise, subgroup, by_pair, by_id, by_name, dynamic_by_id, dynamic_by_name
         )
@@ -1890,10 +1936,11 @@ def analyze(path):
 
     store_facts = {store: sum(values.values()) for store, values in fact_by_store.items()}
     total_fact = sum(store_facts.values())
-    if abs(total_fact - source_total) > 0.01:
-        raise ValueError("Контроль выручки не пройден: сумма категорий отличается от суммы выгрузки")
+    if abs(total_fact + excluded_apk_revenue - source_total) > 0.01:
+        raise ValueError("Контроль выручки не пройден: отчет + исключенный АПК не равны выгрузке")
     audit = {
         "source_total": source_total,
+        "excluded_apk_revenue": excluded_apk_revenue,
         "new_stores": new_stores,
         "new_groups": new_groups,
         "new_store_revenue": sum(store_facts[store] for store in new_stores),
@@ -1974,7 +2021,7 @@ def build_report(input_path, output_path):
     for row in rows:
         ws_sum.append(row)
     ws_sum["J2"] = "Ноябрь 2026: использована проверенная сумма планов магазинов Актобе 539,5 млн тг."
-    ws_sum["J3"] = "Планы категорий других городов распределены по структуре предыдущего плана."
+    ws_sum["J3"] = "Uralsk-20: 3 млн тг, категории приблизительно по структуре Уральска; Ақтөбе/АПК исключен."
     for r in [4,5,8,10]:
         ws_sum[f"B{r}"].number_format = '#,##0'
     for r in [7,9]:
@@ -2134,8 +2181,9 @@ def build_report(input_path, output_path):
     audit_rows = [
         ["Показатель", "Значение", "Комментарий"],
         ["Выручка в выгрузке", audit["source_total"], "Сумма распознанных строк iiko"],
-        ["Выручка в отчете", total_fact, "Сумма по всем магазинам и категориям"],
-        ["Разница", total_fact - audit["source_total"], "Должна равняться нулю"],
+        ["Исключено: Ақтөбе/АПК", audit["excluded_apk_revenue"], "Не включено в план/факт и рейтинги"],
+        ["Выручка в отчете", total_fact, "Сумма по всем учитываемым магазинам"],
+        ["Разница", total_fact + audit["excluded_apk_revenue"] - audit["source_total"], "Отчет + АПК - выгрузка = 0"],
         ["Новые магазины", len(audit["new_stores"]), "Учитываются отдельно, план = 0 (не задан)"],
         ["Выручка новых магазинов", audit["new_store_revenue"], "Включена в общий факт"],
         ["Новые группы", len(audit["new_groups"]), "Учитываются отдельно, не объединены произвольно"],
@@ -2146,7 +2194,7 @@ def build_report(input_path, output_path):
     for row in audit_rows:
         ws_audit.append(row)
     style_header(ws_audit[2])
-    style_header(ws_audit[11])
+    style_header(ws_audit[12])
     for store, raw in sorted(audit["new_stores"].items()):
         ws_audit.append([store, raw, "Факт учтен, план не задан"])
     ws_audit.append([])
@@ -2154,7 +2202,7 @@ def build_report(input_path, output_path):
     style_header(ws_audit[ws_audit.max_row])
     for category, raw in sorted(audit["new_groups"].items()):
         ws_audit.append([category, raw, "Факт учтен отдельно"])
-    for row in range(3, 10):
+    for row in range(3, 11):
         ws_audit.cell(row, 2).number_format = '#,##0.00'
 
     # Formatting
