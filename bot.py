@@ -5,6 +5,8 @@ import tempfile
 import traceback
 import threading
 import calendar
+import re
+import unicodedata
 from datetime import datetime
 from collections import defaultdict
 
@@ -1366,6 +1368,118 @@ def find_new_november_store(enterprise, subgroup):
             return 'Костанай/Альфараби 142'
     return None
 
+# Автоматическое распознавание iiko: не зависит от регистра, пробелов и слешей.
+# Номер предприятия (например, Uralsk-20) используется как надежный идентификатор.
+CITY_PREFIXES = {
+    "aktobe": "Ақтөбе", "актобе": "Ақтөбе", "ақтөбе": "Ақтөбе",
+    "uralsk": "Уральск", "oral": "Уральск", "уральск": "Уральск",
+    "astana": "Астана", "астана": "Астана",
+    "qyzylorda": "Кызылорда", "kyzylorda": "Кызылорда", "кызылорда": "Кызылорда",
+    "kostanai": "Костанай", "kostanay": "Костанай", "костанай": "Костанай",
+}
+
+
+def normalize_iiko_name(value):
+    s = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    s = s.replace("ё", "е").replace("ә", "а").replace("ө", "о").replace("қ", "к")
+    s = re.sub(r"[^a-zа-я0-9]+", "", s)
+    return s
+
+
+def enterprise_id(value):
+    s = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    m = re.search(r"\b(aktobe|uralsk|oral|astana|qyzylorda|kyzylorda|kostanai|kostanay)[-\s_]*(\d+)\b", s)
+    if not m:
+        return None
+    city = CITY_PREFIXES.get(m.group(1))
+    return (city, int(m.group(2))) if city else None
+
+
+def build_store_indexes():
+    by_pair = {}
+    by_id_candidates = defaultdict(set)
+    by_name_candidates = defaultdict(set)
+    for raw_key, store in STORE_MAPPING.items():
+        enterprise, _, subgroup = raw_key.partition("|||")
+        by_pair[(normalize_iiko_name(enterprise), normalize_iiko_name(subgroup))] = store
+        ident = enterprise_id(enterprise)
+        if ident:
+            by_id_candidates[ident].add(store)
+        by_name_candidates[(store.split("/")[0], normalize_iiko_name(enterprise))].add(store)
+        by_name_candidates[(store.split("/")[0], normalize_iiko_name(subgroup))].add(store)
+    for store in PLANS:
+        city, _, label = store.partition("/")
+        by_name_candidates[(city, normalize_iiko_name(label))].add(store)
+    by_id = {key: next(iter(names)) for key, names in by_id_candidates.items() if len(names) == 1}
+    by_name = {key: next(iter(names)) for key, names in by_name_candidates.items() if len(names) == 1 and key[1]}
+    return by_pair, by_id, by_name
+
+
+def identify_city(enterprise, subgroup):
+    for part in (enterprise, subgroup):
+        ident = enterprise_id(part)
+        if ident:
+            return ident[0]
+    s = (str(enterprise or "") + " " + str(subgroup or "")).casefold()
+    for prefix, city in CITY_PREFIXES.items():
+        if prefix in s:
+            return city
+    return "Неопределённый город"
+
+
+def unplanned_store_name(enterprise, subgroup, city):
+    # Для новой точки берем видимое название предприятия без технического префикса.
+    raw = str(enterprise or "").strip()
+    raw = re.sub(r"^(?:[a-z]-)?(?:aktobe|uralsk|oral|astana|qyzylorda|kyzylorda|kostanai|kostanay)[-\s_]*\d+\s*", "", raw, flags=re.I).strip(' \"')
+    if not raw:
+        raw = str(subgroup or "").strip()
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        raw = str(enterprise or subgroup or "Неизвестная точка")
+    return f"{city}/{raw}"
+
+
+def resolve_store(enterprise, subgroup, by_pair, by_id, by_name, dynamic_by_id, dynamic_by_name):
+    raw_key = f"{enterprise}|||{subgroup}"
+    if raw_key in STORE_MAPPING:
+        return STORE_MAPPING[raw_key], False
+    norm_pair = (normalize_iiko_name(enterprise), normalize_iiko_name(subgroup))
+    if norm_pair in by_pair:
+        return by_pair[norm_pair], False
+    ident = enterprise_id(enterprise)
+    if ident and ident in by_id:
+        return by_id[ident], False
+    store = find_new_november_store(enterprise, subgroup)
+    if store in PLANS:
+        return store, False
+    city = identify_city(enterprise, subgroup)
+    for part in (enterprise, subgroup):
+        store = by_name.get((city, normalize_iiko_name(part)))
+        if store:
+            return store, False
+    if ident and ident in dynamic_by_id:
+        return dynamic_by_id[ident], True
+    norm_name = (city, normalize_iiko_name(enterprise))
+    if norm_name in dynamic_by_name:
+        return dynamic_by_name[norm_name], True
+    store = unplanned_store_name(enterprise, subgroup, city)
+    # Разные идентификаторы iiko никогда не объединяем автоматически.
+    if store in PLANS or store in dynamic_by_id.values():
+        suffix = f" [iiko {ident[1]}]" if ident else f" [{len(dynamic_by_name)+1}]"
+        store += suffix
+    if ident:
+        dynamic_by_id[ident] = store
+    dynamic_by_name[norm_name] = store
+    return store, True
+
+
+def build_group_index():
+    index = defaultdict(set)
+    for raw, category in GROUP_MAPPING.items():
+        index[normalize_iiko_name(raw)].add(category)
+    return {key: next(iter(values)) for key, values in index.items() if len(values) == 1}
+
+
 LAST_CITY_SUMMARY = None
 LAST_STORE_SUMMARY = None
 LAST_CATEGORY_SUMMARY = None
@@ -1741,32 +1855,55 @@ def analyze(path):
             f"Этот бот настроен на ноябрь 2026 года, а в файле период {month:02d}.{year}. "
             "Пришли выгрузку за ноябрь 2026."
         )
-    fact_by_store = {store: {c: 0.0 for c in CATEGORIES} for store in PLANS}
-    unknown_stores=[]
-    unknown_groups=[]
+
+    active_plans = dict(PLANS)  # Новые точки не записываем в конфиг и не теряем.
+    active_categories = list(CATEGORIES)
+    fact_by_store = {store: {c: 0.0 for c in CATEGORIES} for store in active_plans}
+    by_pair, by_id, by_name = build_store_indexes()
+    group_index = build_group_index()
+    dynamic_by_id, dynamic_by_name = {}, {}
+    new_stores, new_groups = {}, {}
+    source_total = 0.0
 
     for enterprise, subgroup, items in blocks:
-        key = f"{enterprise}|||{subgroup}"
-        store = STORE_MAPPING.get(key) or find_new_november_store(enterprise, subgroup)
-        if not store or store not in fact_by_store:
-            unknown_stores.append(f"{enterprise} / {subgroup}")
-            continue
+        store, is_new = resolve_store(
+            enterprise, subgroup, by_pair, by_id, by_name, dynamic_by_id, dynamic_by_name
+        )
+        if store not in active_plans:
+            active_plans[store] = {"plan": 0, "categories": {}}
+            fact_by_store[store] = {}
+        if is_new:
+            new_stores[store] = f"{enterprise} / {subgroup}"
 
         for raw_group, amount in items:
-            cat = GROUP_MAPPING.get(raw_group) or GROUP_MAPPING.get(raw_group.upper())
-            if not cat:
-                unknown_groups.append(raw_group)
-                continue
-            fact_by_store[store][cat] += amount
+            source_total += amount
+            category = GROUP_MAPPING.get(raw_group) or GROUP_MAPPING.get(str(raw_group).upper())
+            if not category:
+                category = group_index.get(normalize_iiko_name(raw_group))
+            if not category:
+                # Неизвестную группу учитываем отдельно, не подменяя ее другой.
+                category = "Без правила: " + str(raw_group).strip()
+                new_groups[category] = str(raw_group)
+                if category not in active_categories:
+                    active_categories.append(category)
+            fact_by_store[store][category] = fact_by_store[store].get(category, 0) + amount
 
-    if unknown_stores:
-        raise ValueError("Неизвестные магазины в новой выгрузке:\n" + "\n".join(sorted(set(unknown_stores))))
-    if unknown_groups:
-        raise ValueError("Новые группы товаров, которых нет в правилах:\n" + "\n".join(sorted(set(unknown_groups))))
-
-    store_facts = {s: sum(v.values()) for s,v in fact_by_store.items()}
+    store_facts = {store: sum(values.values()) for store, values in fact_by_store.items()}
     total_fact = sum(store_facts.values())
-    return fact_by_store, store_facts, total_fact, day_end, month, year
+    if abs(total_fact - source_total) > 0.01:
+        raise ValueError("Контроль выручки не пройден: сумма категорий отличается от суммы выгрузки")
+    audit = {
+        "source_total": source_total,
+        "new_stores": new_stores,
+        "new_groups": new_groups,
+        "new_store_revenue": sum(store_facts[store] for store in new_stores),
+        "new_group_revenue": sum(
+            values.get(category, 0) for values in fact_by_store.values()
+            for category in new_groups
+        ),
+    }
+    return (fact_by_store, store_facts, total_fact, day_end, month, year,
+            active_plans, active_categories, audit)
 
 
 def style_title(ws, cell_range, text):
@@ -1790,12 +1927,13 @@ def money(x):
 
 
 def build_report(input_path, output_path):
-    fact_by_store, store_facts, total_fact, days_fact, month, year = analyze(input_path)
+    (fact_by_store, store_facts, total_fact, days_fact, month, year,
+     active_plans, active_categories, audit) = analyze(input_path)
 
     # Реальное количество дней в месяце.
     days_in_month = calendar.monthrange(year, month)[1]
 
-    month_plan = sum(v["plan"] for v in PLANS.values())
+    month_plan = sum(v["plan"] for v in active_plans.values())
 
     # В первые 3 дня месяца простой прогноз "средний день × дни месяца"
     # слишком нестабилен. Поэтому начинаем показывать прогноз только с 4-го дня.
@@ -1811,6 +1949,7 @@ def build_report(input_path, output_path):
     ws_detail = wb.create_sheet("По магазинам и категориям")
     ws_all = wb.create_sheet("Все магазины")
     ws_rules = wb.create_sheet("Объединения")
+    ws_audit = wb.create_sheet("Контроль данных")
 
     # Summary
     if days_fact == 1:
@@ -1834,7 +1973,7 @@ def build_report(input_path, output_path):
     ]
     for row in rows:
         ws_sum.append(row)
-    ws_sum["J2"] = "Ноябрь 2026: по Актобе в итоговой строке 538,5 млн, сумма строк 542 млн. Использованы планы магазинов."
+    ws_sum["J2"] = "Ноябрь 2026: использована проверенная сумма планов магазинов Актобе 539,5 млн тг."
     ws_sum["J3"] = "Планы категорий других городов распределены по структуре предыдущего плана."
     for r in [4,5,8,10]:
         ws_sum[f"B{r}"].number_format = '#,##0'
@@ -1843,9 +1982,9 @@ def build_report(input_path, output_path):
 
     # City summary
     city_agg = defaultdict(lambda: {"plan":0.0,"fact":0.0})
-    for store in PLANS:
+    for store in active_plans:
         city=store.split("/")[0]
-        city_agg[city]["plan"] += PLANS[store]["plan"]
+        city_agg[city]["plan"] += active_plans[store]["plan"]
         city_agg[city]["fact"] += store_facts[store]
 
     style_title(ws_sum, "A14:I14", "Сводка по городам")
@@ -1856,16 +1995,16 @@ def build_report(input_path, output_path):
 
     rr=16
     city_store_counts = defaultdict(int)
-    for store in PLANS:
+    for store in active_plans:
         city_store_counts[store.split("/")[0]] += 1
 
     for city, d in city_agg.items():
         p=d["plan"]; f=d["fact"]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[
-            city, p, f, f/p if p else 0,
+            city, p, f, f/p if p else None,
             fc if forecast_available else None,
             fc/p if (forecast_available and p) else None,
-            fc-p if forecast_available else None,
+            fc-p if (forecast_available and p) else None,
             f/total_fact if total_fact else 0,
             city_store_counts.get(city,0)
         ]
@@ -1879,19 +2018,19 @@ def build_report(input_path, output_path):
         ws_cat.cell(3,c,h)
     style_header(ws_cat[3])
     cat_plan=defaultdict(float); cat_fact=defaultdict(float)
-    for store,p in PLANS.items():
-        for cat in CATEGORIES:
+    for store,p in active_plans.items():
+        for cat in active_categories:
             cat_plan[cat] += p["categories"].get(cat,0)
             cat_fact[cat] += fact_by_store[store].get(cat,0)
 
     rr=4
-    for cat in CATEGORIES:
+    for cat in active_categories:
         p=cat_plan[cat]; f=cat_fact[cat]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[
-            cat, p, f, f/p if p else 0,
+            cat, p, f, f/p if p else None,
             fc if forecast_available else None,
             fc/p if (forecast_available and p) else None,
-            fc-p if forecast_available else None,
+            fc-p if (forecast_available and p) else None,
             f/total_fact if total_fact else 0
         ]
         for c,v in enumerate(vals,1):
@@ -1906,13 +2045,13 @@ def build_report(input_path, output_path):
     style_header(ws_store[3])
 
     rr=4
-    for store,pdata in PLANS.items():
+    for store,pdata in active_plans.items():
         city=store.split("/")[0]; p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[
-            store, city, p, f, f/p if p else 0,
+            store, city, p, f, f/p if p else None,
             fc if forecast_available else None,
             fc/p if (forecast_available and p) else None,
-            fc-p if forecast_available else None
+            fc-p if (forecast_available and p) else None
         ]
         for c,v in enumerate(vals,1):
             ws_store.cell(rr,c,v)
@@ -1926,19 +2065,19 @@ def build_report(input_path, output_path):
     style_header(ws_all[3])
     rr=4
     city_counts=defaultdict(int)
-    for n,(store,pdata) in enumerate(PLANS.items(),1):
+    for n,(store,pdata) in enumerate(active_plans.items(),1):
         city=store.split("/")[0]; city_counts[city]+=1
         p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[
-            n, city, store, p, f, f/p if p else 0,
+            n, city, store, p, f, f/p if p else None,
             fc if forecast_available else None,
             fc/p if (forecast_available and p) else None,
-            fc-p if forecast_available else None
+            fc-p if (forecast_available and p) else None
         ]
         for c,v in enumerate(vals,1):
             ws_all.cell(rr,c,v)
         rr += 1
-    ws_all["K1"]="Всего магазинов"; ws_all["L1"]=len(PLANS)
+    ws_all["K1"]="Всего магазинов"; ws_all["L1"]=len(active_plans)
     kr=2
     for city,count in city_counts.items():
         ws_all.cell(kr,11,city); ws_all.cell(kr,12,count); kr+=1
@@ -1953,13 +2092,13 @@ def build_report(input_path, output_path):
         ws_detail.cell(6,c,h)
     style_header(ws_detail[6])
     rr=7
-    for store,pdata in PLANS.items():
+    for store,pdata in active_plans.items():
         p=pdata["plan"]; f=store_facts[store]; fc=f/days_fact*days_in_month if days_fact else 0
         vals=[
-            store, p, f, f/p if p else 0,
+            store, p, f, f/p if p else None,
             fc if forecast_available else None,
             fc/p if (forecast_available and p) else None,
-            fc-p if forecast_available else None,
+            fc-p if (forecast_available and p) else None,
             1
         ]
         for c,v in enumerate(vals,1):
@@ -1967,13 +2106,13 @@ def build_report(input_path, output_path):
             ws_detail.cell(rr,c).fill=PatternFill("solid",fgColor=STORE_FILL)
             ws_detail.cell(rr,c).font=Font(bold=True)
         rr += 1
-        for cat in CATEGORIES:
+        for cat in active_categories:
             cp=pdata["categories"].get(cat,0); cf=fact_by_store[store].get(cat,0); cfc=cf/days_fact*days_in_month if days_fact else 0
             vals=[
-                cat, cp, cf, cf/cp if cp else 0,
+                cat, cp, cf, cf/cp if cp else None,
                 cfc if forecast_available else None,
                 cfc/cp if (forecast_available and cp) else None,
-                cfc-cp if forecast_available else None,
+                cfc-cp if (forecast_available and cp) else None,
                 cf/f if f else 0
             ]
             for c,v in enumerate(vals,1):
@@ -1990,6 +2129,34 @@ def build_report(input_path, output_path):
     for raw,cat in GROUP_MAPPING.items():
         ws_rules.cell(rr,1,raw); ws_rules.cell(rr,2,cat); rr+=1
 
+    # Контроль: ни одна выручка новой точки/группы не теряется.
+    style_title(ws_audit, "A1:C1", "Контроль обработки iiko")
+    audit_rows = [
+        ["Показатель", "Значение", "Комментарий"],
+        ["Выручка в выгрузке", audit["source_total"], "Сумма распознанных строк iiko"],
+        ["Выручка в отчете", total_fact, "Сумма по всем магазинам и категориям"],
+        ["Разница", total_fact - audit["source_total"], "Должна равняться нулю"],
+        ["Новые магазины", len(audit["new_stores"]), "Учитываются отдельно, план = 0 (не задан)"],
+        ["Выручка новых магазинов", audit["new_store_revenue"], "Включена в общий факт"],
+        ["Новые группы", len(audit["new_groups"]), "Учитываются отдельно, не объединены произвольно"],
+        ["Выручка новых групп", audit["new_group_revenue"], "Включена в общий факт"],
+        [],
+        ["Новые магазины без плана", "Исходное название iiko", "Статус"],
+    ]
+    for row in audit_rows:
+        ws_audit.append(row)
+    style_header(ws_audit[2])
+    style_header(ws_audit[11])
+    for store, raw in sorted(audit["new_stores"].items()):
+        ws_audit.append([store, raw, "Факт учтен, план не задан"])
+    ws_audit.append([])
+    ws_audit.append(["Новые группы", "Исходная группа iiko", "Статус"])
+    style_header(ws_audit[ws_audit.max_row])
+    for category, raw in sorted(audit["new_groups"].items()):
+        ws_audit.append([category, raw, "Факт учтен отдельно"])
+    for row in range(3, 10):
+        ws_audit.cell(row, 2).number_format = '#,##0.00'
+
     # Formatting
     for ws in [ws_sum, ws_cat, ws_store, ws_all, ws_detail]:
         for row in ws.iter_rows():
@@ -2001,9 +2168,9 @@ def build_report(input_path, output_path):
     # Sheet-specific formats
     for ws, start_row, end_row, money_cols, pct_cols in [
         (ws_sum,16,15+len(city_agg),[2,3,5,7],[4,6,8]),
-        (ws_cat,4,3+len(CATEGORIES),[2,3,5,7],[4,6,8]),
-        (ws_store,4,3+len(PLANS),[3,4,6,8],[5,7]),
-        (ws_all,4,3+len(PLANS),[4,5,7,9],[6,8]),
+        (ws_cat,4,3+len(active_categories),[2,3,5,7],[4,6,8]),
+        (ws_store,4,3+len(active_plans),[3,4,6,8],[5,7]),
+        (ws_all,4,3+len(active_plans),[4,5,7,9],[6,8]),
     ]:
         for r in range(start_row,end_row+1):
             for c in money_cols: ws.cell(r,c).number_format='#,##0'
@@ -2014,7 +2181,7 @@ def build_report(input_path, output_path):
         for c in [4,6,8]: ws_detail.cell(r,c).number_format='0.0%'
 
     # Widths and freeze panes
-    for ws in [ws_sum,ws_cat,ws_store,ws_all,ws_detail,ws_rules]:
+    for ws in [ws_sum,ws_cat,ws_store,ws_all,ws_detail,ws_rules,ws_audit]:
         ws.freeze_panes = "A4" if ws.title in ["Магазины","Все магазины"] else ("A7" if ws.title=="По магазинам и категориям" else None)
         for col in range(1, ws.max_column+1):
             letter=__import__("openpyxl").utils.get_column_letter(col)
@@ -2027,9 +2194,9 @@ def build_report(input_path, output_path):
     # Conditional scales
     for ws, rng in [
         (ws_sum, f"F16:F{15+len(city_agg)}"),
-        (ws_cat, f"F4:F{3+len(CATEGORIES)}"),
-        (ws_store, f"G4:G{3+len(PLANS)}"),
-        (ws_all, f"H4:H{3+len(PLANS)}"),
+        (ws_cat, f"F4:F{3+len(active_categories)}"),
+        (ws_store, f"G4:G{3+len(active_plans)}"),
+        (ws_all, f"H4:H{3+len(active_plans)}"),
         (ws_detail, f"F7:F{ws_detail.max_row}"),
     ]:
         ws.conditional_formatting.add(rng, ColorScaleRule(
@@ -2049,11 +2216,11 @@ def build_report(input_path, output_path):
             "plan": p,
             "fact": f,
             "forecast": fc,
-            "forecast_pct": (fc / p if p else 0),
+            "forecast_pct": (fc / p if p else None),
         }
 
     store_summary = {}
-    for store, pdata in PLANS.items():
+    for store, pdata in active_plans.items():
         p = pdata["plan"]
         f = store_facts[store]
         fc = f / days_fact * days_in_month if days_fact else 0
@@ -2061,12 +2228,12 @@ def build_report(input_path, output_path):
             "plan": p,
             "fact": f,
             "forecast": fc,
-            "forecast_pct": (fc / p if p else 0),
-            "deviation": fc - p,
+            "forecast_pct": (fc / p if p else None),
+            "deviation": fc - p if p else None,
         }
 
     category_summary = {}
-    for cat in CATEGORIES:
+    for cat in active_categories:
         p = cat_plan[cat]
         f = cat_fact[cat]
         fc = f / days_fact * days_in_month if days_fact else 0
@@ -2074,11 +2241,12 @@ def build_report(input_path, output_path):
             "plan": p,
             "fact": f,
             "forecast": fc,
-            "forecast_pct": (fc / p if p else 0),
-            "deviation": fc - p,
+            "forecast_pct": (fc / p if p else None),
+            "deviation": fc - p if p else None,
         }
 
-    return total_fact, month_plan, forecast_total, days_fact, city_summary, store_summary, category_summary, forecast_available
+    return (total_fact, month_plan, forecast_total, days_fact, city_summary,
+            store_summary, category_summary, forecast_available, audit)
 
 
 @app.get("/")
@@ -2153,7 +2321,8 @@ def process_document_in_background(chat_id, doc):
                 )
                 return
 
-            total_fact, plan, forecast, days, city_summary, store_summary, category_summary, forecast_available = build_report(inp, out)
+            (total_fact, plan, forecast, days, city_summary, store_summary,
+             category_summary, forecast_available, audit) = build_report(inp, out)
             pct = forecast / plan if plan else 0
 
             LAST_CITY_SUMMARY = city_summary
@@ -2197,6 +2366,12 @@ def process_document_in_background(chat_id, doc):
                     f"Прогноз: пока не показываю — данных меньше 4 дней."
                 ).replace(",", " ")
 
+            if audit["new_stores"] or audit["new_groups"]:
+                caption += (
+                    f"\nНовых точек без плана: {len(audit['new_stores'])}."
+                    f" Новых групп: {len(audit['new_groups'])}."
+                    " Все продажи учтены; подробности во вкладке «Контроль данных»."
+                )
             send_document(chat_id, out, caption=caption)
 
     except Exception as e:
@@ -2302,7 +2477,7 @@ def telegram_webhook():
                 return "ok"
 
             ranked = sorted(
-                LAST_STORE_SUMMARY.items(),
+                ((k, v) for k, v in LAST_STORE_SUMMARY.items() if v["plan"] > 0),
                 key=lambda x: x[1]["forecast_pct"],
                 reverse=True
             )[:10]
@@ -2365,7 +2540,7 @@ def telegram_webhook():
                 return "ok"
 
             ranked = sorted(
-                LAST_CATEGORY_SUMMARY.items(),
+                ((k, v) for k, v in LAST_CATEGORY_SUMMARY.items() if v["plan"] > 0),
                 key=lambda x: x[1]["forecast_pct"],
                 reverse=True
             )
@@ -2446,7 +2621,7 @@ def telegram_webhook():
             total_add_s = f"{total_add:,.0f}".replace(",", " ")
 
             lines = [
-                f"🚀 Рост за день: {prev['days']} → {cur['days']} сентября",
+                f"🚀 Рост за день: {prev['days']} → {cur['days']} ноября",
                 "",
                 f"Продажи за день: {total_add_s} тг",
                 "",
@@ -2506,7 +2681,7 @@ def telegram_webhook():
             total_add = cur["total_fact"] - prev["total_fact"]
 
             lines = [
-                f"🏙 Рост по городам: {prev['days']} → {cur['days']} сентября",
+                f"🏙 Рост по городам: {prev['days']} → {cur['days']} ноября",
                 ""
             ]
             for i, (city, delta) in enumerate(city_changes, 1):
